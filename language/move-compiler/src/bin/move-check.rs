@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -12,8 +13,10 @@ use move_compiler::{
 
 #[derive(Debug, Parser)]
 #[clap(
-    name = "Move Check",
-    about = "Check Move source code, without compiling to bytecode."
+    name = "move-check",
+    about = "Check Move source code, without compiling to bytecode",
+    author,
+    version
 )]
 pub struct Options {
     /// The source files to check
@@ -64,12 +67,9 @@ pub fn main() -> anyhow::Result<()> {
         named_addresses,
     } = Options::parse();
     let named_addr_map = verify_and_create_named_address_mapping(named_addresses)?;
-    let _files = move_compiler::Compiler::new(
-        vec![(source_files, named_addr_map.clone())],
-        vec![(dependencies, named_addr_map)],
-    )
-    .set_interface_files_dir_opt(out_dir)
-    .set_flags(flags)
-    .check_and_report()?;
+    let _files = move_compiler::Compiler::from_files(source_files, dependencies, named_addr_map)
+        .set_interface_files_dir_opt(out_dir)
+        .set_flags(flags)
+        .check_and_report()?;
     Ok(())
 }

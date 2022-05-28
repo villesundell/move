@@ -1,14 +1,15 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-pub mod compilation;
 mod package_lock;
+
+pub mod compilation;
 pub mod resolution;
 pub mod source_package;
 
 use anyhow::{bail, Result};
 use clap::*;
-use compilation::compiled_package::CompilationCachingStatus;
 use move_core_types::account_address::AccountAddress;
 use move_model::model::GlobalEnv;
 use serde::{Deserialize, Serialize};
@@ -35,7 +36,6 @@ pub enum Architecture {
 
     AsyncMove,
 
-    #[cfg(feature = "evm-backend")]
     Ethereum,
 }
 
@@ -46,7 +46,6 @@ impl fmt::Display for Architecture {
 
             Self::AsyncMove => write!(f, "async-move"),
 
-            #[cfg(feature = "evm-backend")]
             Self::Ethereum => write!(f, "ethereum"),
         }
     }
@@ -68,7 +67,6 @@ impl Architecture {
 
             "async-move" => Self::AsyncMove,
 
-            #[cfg(feature = "evm-backend")]
             "ethereum" => Self::Ethereum,
 
             _ => {
@@ -92,10 +90,7 @@ impl Architecture {
 }
 
 #[derive(Debug, Parser, Clone, Serialize, Deserialize, Eq, PartialEq, PartialOrd)]
-#[clap(
-    name = "Move Package",
-    about = "Package and build system for Move code."
-)]
+#[clap(author, version, about)]
 pub struct BuildConfig {
     /// Compile in 'dev' mode. The 'dev-addresses' and 'dev-dependencies' fields will be used if
     /// this flag is set. This flag is useful for development of packages that expose named
@@ -104,7 +99,7 @@ pub struct BuildConfig {
     pub dev_mode: bool,
 
     /// Compile in 'test' mode. The 'dev-addresses' and 'dev-dependencies' fields will be used
-    /// along with any code in the 'test' directory.
+    /// along with any code in the 'tests' directory.
     #[clap(name = "test-mode", long = "test", global = true)]
     pub test_mode: bool,
 
@@ -159,7 +154,11 @@ pub struct ModelConfig {
 impl BuildConfig {
     /// Compile the package at `path` or the containing Move package.
     pub fn compile_package<W: Write>(self, path: &Path, writer: &mut W) -> Result<CompiledPackage> {
-        Ok(self.compile_package_with_caching_info(path, writer)?.0)
+        let resolved_graph = self.resolution_graph_for_package(path)?;
+        let mutx = PackageLock::lock();
+        let ret = BuildPlan::create(resolved_graph)?.compile(writer);
+        mutx.unlock();
+        ret
     }
 
     #[cfg(feature = "evm-backend")]
@@ -167,20 +166,6 @@ impl BuildConfig {
         let resolved_graph = self.resolution_graph_for_package(path)?;
         let mutx = PackageLock::lock();
         let ret = BuildPlan::create(resolved_graph)?.compile_evm(writer);
-        mutx.unlock();
-        ret
-    }
-
-    /// Compile the package at `path` or the containing Move package and return whether or not all
-    /// packages and dependencies were cached or not.
-    pub fn compile_package_with_caching_info<W: Write>(
-        self,
-        path: &Path,
-        writer: &mut W,
-    ) -> Result<(CompiledPackage, CompilationCachingStatus)> {
-        let resolved_graph = self.resolution_graph_for_package(path)?;
-        let mutx = PackageLock::lock();
-        let ret = BuildPlan::create(resolved_graph)?.compile(writer);
         mutx.unlock();
         ret
     }

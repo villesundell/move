@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -11,7 +12,7 @@ use colored::*;
 use move_binary_format::{errors::VMResult, file_format::CompiledModule};
 use move_bytecode_utils::Modules;
 use move_compiler::{
-    shared::{Flags, NumericalAddress},
+    shared::{Flags, NumericalAddress, PackagePaths},
     unit_test::{ExpectedFailure, ModuleTestPlan, TestCase, TestPlan},
 };
 use move_core_types::{
@@ -364,7 +365,11 @@ impl SharedTestingConfig {
 
         let stackless_model = if self.check_stackless_vm {
             let model = run_model_builder_with_options_and_compilation_flags(
-                vec![(filtered_sources, self.named_address_values.clone())],
+                vec![PackagePaths {
+                    name: None,
+                    paths: filtered_sources,
+                    named_address_map: self.named_address_values.clone(),
+                }],
                 vec![],
                 ModelBuilderOptions::default(),
                 Flags::testing(),
@@ -478,7 +483,10 @@ impl SharedTestingConfig {
                     // Expected the test the abort with a specific `code`, and it did abort with
                     // that abort code
                     (Some(ExpectedFailure::ExpectedWithCode(code)), Some(other_code))
-                        if err.major_status() == StatusCode::ABORTED && *code == other_code =>
+                        if matches!(
+                            err.major_status(),
+                            StatusCode::ABORTED | StatusCode::VECTOR_OPERATION_ERROR
+                        ) && *code == other_code =>
                     {
                         output.pass(function_name);
                         stats.test_success(test_run_info, test_plan);
@@ -595,7 +603,11 @@ impl SharedTestingConfig {
             .collect::<Vec<_>>();
 
         let model = run_model_builder_with_options_and_compilation_flags(
-            vec![(filtered_sources, self.named_address_values.clone())],
+            vec![PackagePaths {
+                name: None,
+                paths: filtered_sources,
+                named_address_map: self.named_address_values.clone(),
+            }],
             vec![],
             ModelBuilderOptions::default(),
             Flags::testing(),

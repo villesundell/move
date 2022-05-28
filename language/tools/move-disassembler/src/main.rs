@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -18,10 +19,7 @@ use move_ir_types::location::Spanned;
 use std::{fs, path::Path};
 
 #[derive(Debug, Parser)]
-#[clap(
-    name = "Move Bytecode Disassembler",
-    about = "Print a human-readable version of Move bytecode (.mv files)"
-)]
+#[clap(author, version, about)]
 struct Args {
     /// Skip printing of private functions.
     #[clap(long = "skip-private")]

@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Binary format for transactions and modules.
@@ -33,11 +34,11 @@ use crate::{
     internals::ModuleIndex,
     IndexKind, SignatureTokenKind,
 };
-use mirai_annotations::*;
 use move_core_types::{
     account_address::AccountAddress,
     identifier::{IdentStr, Identifier},
     language_storage::ModuleId,
+    metadata::Metadata,
     vm_status::StatusCode,
 };
 #[cfg(any(test, feature = "fuzzing"))]
@@ -1656,7 +1657,7 @@ impl Bytecode {
 
     /// Return the successor offsets of this bytecode instruction.
     pub fn get_successors(pc: CodeOffset, code: &[Bytecode]) -> Vec<CodeOffset> {
-        checked_precondition!(
+        assert!(
             // The program counter could be added to at most twice and must remain
             // within the bounds of the code.
             pc <= u16::max_value() - 2 && (pc as usize) < code.len(),
@@ -1716,11 +1717,12 @@ pub struct CompiledScript {
     /// Constant pool. The constant values used in the transaction.
     pub constant_pool: ConstantPool,
 
+    pub metadata: Vec<Metadata>,
+
+    pub code: CodeUnit,
     pub type_parameters: Vec<AbilitySet>,
 
     pub parameters: SignatureIndex,
-
-    pub code: CodeUnit,
 }
 
 impl CompiledScript {
@@ -1767,6 +1769,8 @@ pub struct CompiledModule {
     pub address_identifiers: AddressIdentifierPool,
     /// Constant pool. The constant values used in the module.
     pub constant_pool: ConstantPool,
+
+    pub metadata: Vec<Metadata>,
 
     /// Types defined in this module.
     pub struct_defs: Vec<StructDefinition>,
@@ -1818,6 +1822,7 @@ impl Arbitrary for CompiledScript {
                         identifiers,
                         address_identifiers,
                         constant_pool: vec![],
+                        metadata: vec![],
                         type_parameters,
                         parameters,
                         code,
@@ -1878,6 +1883,7 @@ impl Arbitrary for CompiledModule {
                         identifiers,
                         address_identifiers,
                         constant_pool: vec![],
+                        metadata: vec![],
                         struct_defs,
                         function_defs,
                     }
@@ -1890,7 +1896,7 @@ impl Arbitrary for CompiledModule {
 impl CompiledModule {
     /// Returns the count of a specific `IndexKind`
     pub fn kind_count(&self, kind: IndexKind) -> usize {
-        precondition!(!matches!(
+        debug_assert!(!matches!(
             kind,
             IndexKind::LocalPool
                 | IndexKind::CodeDefinition
@@ -1948,6 +1954,7 @@ pub fn empty_module() -> CompiledModule {
         identifiers: vec![self_module_name().to_owned()],
         address_identifiers: vec![AccountAddress::ZERO],
         constant_pool: vec![],
+        metadata: vec![],
         function_defs: vec![],
         struct_defs: vec![],
         struct_handles: vec![],
@@ -2028,6 +2035,7 @@ pub fn empty_script() -> CompiledScript {
         identifiers: vec![],
         address_identifiers: vec![],
         constant_pool: vec![],
+        metadata: vec![],
 
         type_parameters: vec![],
         parameters: SignatureIndex(0),

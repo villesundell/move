@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::experiments::Experiment;
@@ -7,7 +8,7 @@ use codespan_reporting::diagnostic::Severity;
 
 /// Options for a run of the compiler.
 #[derive(Parser, Debug)]
-#[clap(name = "move-to-yul", about = "Move Solidity Generator")]
+#[clap(author, version, about)]
 pub struct Options {
     /// Directories where to lookup dependencies.
     #[clap(

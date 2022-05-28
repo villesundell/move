@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -17,8 +18,10 @@ use std::{
 
 #[derive(Debug, Parser)]
 #[clap(
-    name = "Move VM Coverage Summary",
-    about = "Creates a coverage summary from the trace data collected from the Move VM"
+    name = "coverage-summaries",
+    about = "Creates a coverage summary from the trace data collected from the Move VM",
+    author,
+    version
 )]
 struct Args {
     /// The path to the coverage map or trace file

@@ -1,10 +1,22 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    attributes, events::EventSignature, evm_transformation::EvmTransformationProcessor,
-    native_functions::NativeFunctions, yul_functions, yul_functions::YulFunction, Options,
+    attributes,
+    attributes::{
+        extract_contract_name, is_callable_fun, is_create_fun, is_event_struct,
+        is_evm_contract_module, is_fallback_fun, is_receive_fun, is_storage_struct,
+    },
+    events::EventSignature,
+    evm_transformation::EvmTransformationProcessor,
+    native_functions::NativeFunctions,
+    solidity_ty::SolidityType,
+    yul_functions,
+    yul_functions::YulFunction,
+    Options,
 };
+use anyhow::anyhow;
 use codespan::FileId;
 use itertools::Itertools;
 use move_model::{
@@ -12,7 +24,8 @@ use move_model::{
     code_writer::CodeWriter,
     emitln,
     model::{
-        FunId, FunctionEnv, GlobalEnv, ModuleEnv, QualifiedId, QualifiedInstId, StructEnv, StructId,
+        FunId, FunctionEnv, GlobalEnv, ModuleEnv, ModuleId, QualifiedId, QualifiedInstId,
+        StructEnv, StructId,
     },
     ty::{PrimitiveType, Type},
 };
@@ -30,6 +43,9 @@ use std::{
 
 /// Address at which the EVM modules are stored.
 const EVM_MODULE_ADDRESS: &str = "0x2";
+
+/// Address at which the EVM modules are stored.
+const STD_MODULE_ADDRESS: &str = "0x1";
 
 /// Immutable context passed through the compilation.
 pub(crate) struct Context<'a> {
@@ -49,6 +65,13 @@ pub(crate) struct Context<'a> {
     pub(crate) file_id_map: BTreeMap<FileId, (usize, String)>,
     /// Mapping of event structs to corresponding event signatures
     pub(crate) event_signature_map: RefCell<BTreeMap<QualifiedInstId<StructId>, EventSignature>>,
+    /// Vector of abi structs
+    pub(crate) abi_structs: RefCell<Vec<QualifiedInstId<StructId>>>,
+    /// Mapping of abi structs to corresponding solidity types
+    pub(crate) abi_struct_signature_map: RefCell<BTreeMap<QualifiedInstId<StructId>, SolidityType>>,
+    /// Mapping of abi structs names to abi structs
+    pub(crate) abi_struct_name_map: RefCell<BTreeMap<String, QualifiedInstId<StructId>>>,
+
     /// A code writer where we emit JSON-ABI.
     pub abi_writer: CodeWriter,
 }
@@ -68,7 +91,28 @@ pub(crate) struct StructLayout {
     pub pointer_count: usize,
 }
 
+/// Describes a contract as identified via attribute analysis of the model.
+pub(crate) struct Contract {
+    /// The name of the contract.
+    pub name: String,
+    /// The module defining the contract.
+    pub module: ModuleId,
+    /// Optional struct representing storage root.
+    pub storage: Option<StructId>,
+    /// Optional constructor function.
+    pub constructor: Option<FunId>,
+    /// Optional receive function.
+    pub receive: Option<FunId>,
+    /// Optional fallback function.
+    pub fallback: Option<FunId>,
+    /// Functions which are callable, receive, or fallback entry.
+    pub callables: Vec<FunId>,
+}
+
 impl<'a> Context<'a> {
+    // --------------------------------------------------------------------------------------------
+    // Creation
+
     /// Create a new context.
     pub fn new(options: &'a Options, env: &'a GlobalEnv, for_test: bool) -> Self {
         let writer = CodeWriter::new(env.unknown_loc());
@@ -97,9 +141,15 @@ impl<'a> Context<'a> {
             struct_layout: Default::default(),
             native_funs: NativeFunctions::default(),
             event_signature_map: Default::default(),
+            abi_structs: Default::default(),
+            abi_struct_signature_map: Default::default(),
+            abi_struct_name_map: Default::default(),
             abi_writer,
         };
         ctx.native_funs = NativeFunctions::create(&ctx);
+        ctx.build_abi_struct_vec();
+        ctx.build_abi_struct_name_map();
+        ctx.build_abi_struct_signature_map();
         ctx.build_event_signature_map();
         ctx
     }
@@ -137,7 +187,8 @@ impl<'a> Context<'a> {
                     || attributes::is_fallback_fun(fun)
             }
         };
-        let external_name = ModuleName::from_str("0x2", env.symbol_pool().make("ExternalResult"));
+        let external_name =
+            ModuleName::from_str(EVM_MODULE_ADDRESS, env.symbol_pool().make("ExternalResult"));
         for module in env.get_modules() {
             if *module.get_name() == external_name {
                 for fun in module.get_functions() {
@@ -180,31 +231,127 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Return iterator for all functions in the environment which stem from a target module
-    /// and which satsify predicate.
-    pub fn get_target_functions(&self, p: impl Fn(&FunctionEnv) -> bool) -> Vec<FunctionEnv<'a>> {
+    // --------------------------------------------------------------------------------------------
+    // Contract Analysis
+
+    /// Derive the EVM contracts defined in this context. This contains contracts
+    /// defined both in target (i.e. currently compiled) and dependency modules.
+    ///
+    /// This function will produce errors in the global env if attributes are misused,
+    /// and should only be called once because of this.
+    pub fn derive_contracts(&self) -> Vec<Contract> {
         self.env
             .get_modules()
-            .filter(|m| m.is_target())
-            .map(|m| m.into_functions().filter(|f| p(f)))
-            .flatten()
+            .into_iter()
+            .filter_map(|ref m| {
+                if is_evm_contract_module(m) {
+                    Some(self.extract_contract(m))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
+    /// Extract information about a contract from a module.
+    fn extract_contract(&self, module: &ModuleEnv) -> Contract {
+        // Identity name.
+        let name = if let Some(name) = extract_contract_name(module) {
+            name
+        } else {
+            self.make_contract_name(module)
+        };
+        // Identify storage struct
+        let storage_cands = module
+            .get_structs()
+            .filter(is_storage_struct)
+            .take(2)
+            .collect::<Vec<_>>();
+        let storage = match storage_cands.len() {
+            0 => None,
+            1 => Some(storage_cands[0].get_id()),
+            _ => {
+                self.env.error(
+                    &storage_cands[1].get_loc(),
+                    "only one #[storage] struct allowed per contract module",
+                );
+                None
+            }
+        };
+        // Identify special functions.
+        let constructor = self.identify_function(module, is_create_fun, "#[create]");
+        let receive = self.identify_function(module, is_receive_fun, "#[receive]");
+        let fallback = self.identify_function(module, is_fallback_fun, "#[fallback]");
+
+        // Identify callable functions.
+        let callables = module
+            .get_functions()
+            .filter(is_callable_fun)
+            .map(|s| s.get_id())
+            .collect();
+
+        // Check conditions.
+        if storage.is_some() && constructor.is_none() {
+            self.env.error(
+                &module.get_loc(),
+                "contract declares #[storage] struct but misses #[create] function",
+            )
+        }
+
+        Contract {
+            name,
+            module: module.get_id(),
+            storage,
+            constructor,
+            receive,
+            fallback,
+            callables,
+        }
+    }
+
+    fn identify_function(
+        &self,
+        module: &ModuleEnv,
+        pred: impl Fn(&FunctionEnv) -> bool,
+        attr_str: &str,
+    ) -> Option<FunId> {
+        let cands = module
+            .get_functions()
+            .filter(pred)
+            .take(2)
+            .collect::<Vec<_>>();
+        match cands.len() {
+            0 => None,
+            1 => Some(cands[0].get_id()),
+            _ => {
+                self.env.error(
+                    &cands[1].get_loc(),
+                    &format!("only one {} function allowed per contract module", attr_str),
+                );
+                None
+            }
+        }
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Queries
+
     /// Return iterator for all structs in the environment which stem from a target module
-    /// and which satsify predicate.
-    fn get_event_structs(&self, p: impl Fn(&StructEnv) -> bool) -> Vec<StructEnv<'a>> {
+    /// and which satisfy predicate.
+    fn get_target_structs(&self, p: impl Fn(&StructEnv) -> bool) -> Vec<StructEnv<'a>> {
         self.env
             .get_modules()
-            .filter(|m| m.is_target())
             .map(|m| m.into_structs().filter(|f| p(f)))
             .flatten()
             .collect()
     }
 
+    // --------------------------------------------------------------------------------------------
+    // Signature Event Map
+
     /// Build the event signature map
     pub fn build_event_signature_map(&self) {
-        let event_structs_vec = self.get_event_structs(attributes::is_event_struct);
+        let event_structs_vec = self.get_target_structs(is_event_struct);
         let mut event_signature_map_ref = self.event_signature_map.borrow_mut();
         for st_env in event_structs_vec {
             if !self.check_no_generics_struct(&st_env) {
@@ -228,6 +375,104 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Build the vec of abi_structs
+    pub fn build_abi_struct_vec(&self) {
+        let abi_structs_vec = self.get_target_structs(attributes::is_abi_struct);
+        let mut abi_structs_ref = self.abi_structs.borrow_mut();
+        for st_env in abi_structs_vec {
+            abi_structs_ref.push(st_env.get_qualified_id().instantiate(vec![]));
+        }
+
+        // Add structs in the stdlib that can be serialized
+        let p = |st_env: &StructEnv| {
+            let name = st_env.get_full_name_with_address(); // only consider String for now
+            name == format!("{}::ASCII::String", STD_MODULE_ADDRESS)
+        };
+        let built_in_structs = self.get_target_structs(p);
+        for st_env in built_in_structs {
+            abi_structs_ref.push(st_env.get_qualified_id().instantiate(vec![]));
+        }
+    }
+
+    /// Build the map from name to abi structs
+    pub fn build_abi_struct_name_map(&self) {
+        let mut abi_struct_name_map_ref = self.abi_struct_name_map.borrow_mut();
+        let abi_struct_ref = self.abi_structs.borrow();
+        for st_id in abi_struct_ref.iter() {
+            let st_env = self.env.get_struct(st_id.to_qualified_id());
+            let abi_sig_str_opt = attributes::extract_abi_struct_signature(&st_env);
+            let struct_name = if let Some(abi_sig_str) = abi_sig_str_opt {
+                let name_right_idx_opt = abi_sig_str.find('(');
+                if let Some(name_right_idx) = name_right_idx_opt {
+                    abi_sig_str[..name_right_idx].to_string()
+                } else {
+                    panic!("unexpected token");
+                }
+            } else {
+                let mut full_name = st_env.get_full_name_with_address();
+                if let Some(i) = full_name.rfind(':') {
+                    full_name = full_name[i + 1..].to_string();
+                }
+                full_name
+            };
+            if abi_struct_name_map_ref.get(&struct_name).is_none() {
+                abi_struct_name_map_ref.insert(struct_name.clone(), st_id.clone());
+            } else {
+                self.env.error(&st_env.get_loc(), "duplicated struct names");
+            }
+        }
+    }
+
+    /// Build the signature map for abi struct
+    pub fn build_abi_struct_signature_map(&self) {
+        let abi_struct_ref = self.abi_structs.borrow();
+        for st_id in abi_struct_ref.iter() {
+            let st_env = self.env.get_struct(st_id.to_qualified_id());
+            if let Err(msg) = self.build_abi_struct(&st_env) {
+                self.env.error(&st_env.get_loc(), &format!("{}", msg));
+            }
+        }
+    }
+
+    /// Construct the struct type
+    pub fn build_abi_struct(&self, st_env: &StructEnv<'_>) -> anyhow::Result<SolidityType> {
+        assert!(self.is_structs_abi(st_env));
+        assert!(self.check_no_generics_struct(st_env));
+        let mut struct_type = SolidityType::generate_default_struct_type(self, st_env);
+        let abi_sig_str_opt = attributes::extract_abi_struct_signature(st_env);
+        if let Some(abi_sig_str) = abi_sig_str_opt {
+            struct_type = SolidityType::parse_struct_type(self, &abi_sig_str, st_env)?;
+        }
+        let st_id = &st_env.get_qualified_id().instantiate(vec![]);
+        let mut abi_struct_signature_map_ref = self.abi_struct_signature_map.borrow_mut();
+        if abi_struct_signature_map_ref.get(st_id).is_none() {
+            abi_struct_signature_map_ref.insert(st_id.clone(), struct_type.clone());
+        }
+        drop(abi_struct_signature_map_ref);
+        Ok(struct_type)
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Checks
+
+    /// Check whether abi structs exist in the signature map; if not, create and add it to the map
+    pub fn check_or_create_struct_abi(&self, name: &str) -> anyhow::Result<SolidityType> {
+        let abi_struct_name_map_ref = self.abi_struct_name_map.borrow();
+        let st_id_opt = abi_struct_name_map_ref.get(name);
+        if let Some(st_id) = st_id_opt {
+            let abi_struct_signature_map_ref = self.abi_struct_signature_map.borrow();
+            let struct_ty_opt = abi_struct_signature_map_ref.get(st_id);
+            if let Some(struct_ty) = struct_ty_opt {
+                return Ok(struct_ty.clone());
+            } else {
+                let struct_env = self.env.get_struct(st_id.to_qualified_id());
+                drop(abi_struct_signature_map_ref);
+                return self.build_abi_struct(&struct_env);
+            }
+        }
+        Err(anyhow!("cannot create struct abi:{}", name))
+    }
+
     /// Check whether given Move struct has no generics; report error otherwise.
     pub fn check_no_generics_struct(&self, st: &StructEnv<'_>) -> bool {
         if !st.get_type_parameters().is_empty() {
@@ -246,6 +491,9 @@ impl<'a> Context<'a> {
             )
         }
     }
+
+    // --------------------------------------------------------------------------------------------
+    // Name Generation
 
     /// Make the name of a contract.
     pub fn make_contract_name(&self, module: &ModuleEnv) -> String {
@@ -333,6 +581,9 @@ impl<'a> Context<'a> {
         }
     }
 
+    // --------------------------------------------------------------------------------------------
+    // Code Generation
+
     /// Emits a Yul block.
     pub fn emit_block(&self, blk: impl FnOnce()) {
         emitln!(self.writer, "{");
@@ -340,6 +591,14 @@ impl<'a> Context<'a> {
         blk();
         self.writer.unindent();
         emitln!(self.writer, "}");
+    }
+
+    // --------------------------------------------------------------------------------------------
+    // Types
+
+    /// Check whether it is an abi struct or a builtin String type
+    pub fn is_structs_abi(&self, st: &StructEnv<'_>) -> bool {
+        attributes::is_abi_struct(st) || self.is_string(st.get_qualified_id())
     }
 
     /// Returns whether the struct identified by module_id and struct_id is the native U256 struct.
@@ -568,11 +827,26 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// Returns true if the type is a proper struct.
     pub fn type_is_struct(&self, ty: &Type) -> bool {
         use Type::*;
         match ty {
             Struct(m, s, _) => !self.is_u256(m.qualified(*s)) && !self.is_table(m.qualified(*s)),
             _ => false,
+        }
+    }
+
+    /// Returns true if there is a storage struct given and the type is a reference to it.
+    pub fn is_storage_ref(
+        &self,
+        storage_type: &Option<QualifiedInstId<StructId>>,
+        ty: &Type,
+    ) -> bool {
+        if let Some(st) = &storage_type {
+            matches!(ty,
+                Type::Reference(_, et) if et.as_ref() == &st.to_type())
+        } else {
+            false
         }
     }
 }

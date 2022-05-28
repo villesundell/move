@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{source_package::parsed_manifest as PM, Architecture};
@@ -330,7 +331,10 @@ fn parse_dependency(tval: TV) -> Result<PM::Dependency> {
                     let move_home = std::env::var("MOVE_HOME").unwrap_or_else(|_| {
                         format!(
                             "{}/.move",
-                            std::env::var("HOME").expect("env var 'HOME' must be set")
+                            dirs_next::home_dir()
+                                .expect("user's home directory not found")
+                                .to_str()
+                                .unwrap()
                         )
                     });
                     let rev_name = match table.remove("rev") {

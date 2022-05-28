@@ -1,11 +1,12 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 // This file defines vector functionalities.
 
 use crate::{
     context::Context, functions::FunctionGenerator, native_functions::NativeFunctions,
-    yul_functions::YulFunction,
+    yul_functions::YulFunction, Generator,
 };
 use move_model::{
     emitln,
@@ -18,7 +19,7 @@ pub const VECTOR_METADATA_SIZE: usize = 32;
 /// The number of slots allocated initially for an empty vector.
 pub const VECTOR_INITIAL_CAPACITY: usize = 2;
 
-impl<'a> FunctionGenerator<'a> {
+impl Generator {
     pub(crate) fn move_vector_to_storage(
         &mut self,
         ctx: &Context,
@@ -43,7 +44,7 @@ impl<'a> FunctionGenerator<'a> {
             ctx.writer,
             "let {} := {}",
             size_name,
-            self.parent.call_builtin_str(
+            self.call_builtin_str(
                 ctx,
                 YulFunction::MemoryLoadU64,
                 std::iter::once(src.clone())
@@ -60,7 +61,7 @@ impl<'a> FunctionGenerator<'a> {
         );
 
         // Move vector metadata to the storage location
-        self.parent.call_builtin(
+        self.call_builtin(
             ctx,
             YulFunction::AlignedStorageStore,
             vec![dst.clone(), format!("mload({})", src)].into_iter(),
@@ -114,7 +115,7 @@ impl<'a> FunctionGenerator<'a> {
                     clean_flag,
                 );
                 // Store the result at the destination
-                self.parent.call_builtin(
+                self.call_builtin(
                     ctx,
                     YulFunction::AlignedStorageStore,
                     vec![
@@ -125,7 +126,7 @@ impl<'a> FunctionGenerator<'a> {
                 )
             });
         } else {
-            self.parent.call_builtin(
+            self.call_builtin(
                 ctx,
                 YulFunction::AlignedStorageStore,
                 vec![
@@ -138,7 +139,7 @@ impl<'a> FunctionGenerator<'a> {
 
         // Free ptr
         if clean_flag {
-            self.parent.call_builtin(
+            self.call_builtin(
                 ctx,
                 YulFunction::Free,
                 vec![
@@ -178,7 +179,7 @@ impl<'a> FunctionGenerator<'a> {
             ctx.writer,
             "let {} := {}",
             size_name,
-            self.parent.call_builtin_str(
+            self.call_builtin_str(
                 ctx,
                 YulFunction::StorageLoadU64,
                 std::iter::once(src.clone())
@@ -191,7 +192,7 @@ impl<'a> FunctionGenerator<'a> {
             ctx.writer,
             "let {} := {}",
             capacity_name,
-            self.parent.call_builtin_str(
+            self.call_builtin_str(
                 ctx,
                 YulFunction::ClosestGreaterPowerOfTwo,
                 std::iter::once(size_name.clone())
@@ -202,7 +203,7 @@ impl<'a> FunctionGenerator<'a> {
             ctx.writer,
             "{} := {}",
             dst,
-            self.parent.call_builtin_str(
+            self.call_builtin_str(
                 ctx,
                 YulFunction::Malloc,
                 std::iter::once(format!(
@@ -226,7 +227,7 @@ impl<'a> FunctionGenerator<'a> {
             ctx.writer,
             "mstore({}, {})",
             dst,
-            self.parent.call_builtin_str(
+            self.call_builtin_str(
                 ctx,
                 YulFunction::AlignedStorageLoad,
                 std::iter::once(src.clone()),
@@ -234,7 +235,7 @@ impl<'a> FunctionGenerator<'a> {
         );
 
         // Store new capacity in memory
-        self.parent.call_builtin(
+        self.call_builtin(
             ctx,
             YulFunction::MemoryStoreU64,
             vec![format!("add({}, 8)", dst), capacity_name].into_iter(),
@@ -277,7 +278,7 @@ impl<'a> FunctionGenerator<'a> {
                 let linked_dst_name = format!("$linked_dst_{}", hash);
 
                 // Load the pointer to the linked storage.
-                let load_call = self.parent.call_builtin_str(
+                let load_call = self.call_builtin_str(
                     ctx,
                     YulFunction::AlignedStorageLoad,
                     std::iter::once(src_ptr.clone()),
@@ -297,7 +298,7 @@ impl<'a> FunctionGenerator<'a> {
                 emitln!(ctx.writer, "mstore({}, {})", dst_ptr, linked_dst_name);
                 // Clear the storage to get a refund
                 if clean_flag {
-                    self.parent.call_builtin(
+                    self.call_builtin(
                         ctx,
                         YulFunction::AlignedStorageStore,
                         vec![src_ptr, 0.to_string()].into_iter(),
@@ -305,7 +306,7 @@ impl<'a> FunctionGenerator<'a> {
                 }
             });
         } else {
-            let load_call = self.parent.call_builtin_str(
+            let load_call = self.call_builtin_str(
                 ctx,
                 YulFunction::AlignedStorageLoad,
                 std::iter::once(format!("add({}, {})", data_src_name, offs_name)),
@@ -319,7 +320,7 @@ impl<'a> FunctionGenerator<'a> {
             );
             // fill storage with 0s
             if clean_flag {
-                self.parent.call_builtin(
+                self.call_builtin(
                     ctx,
                     YulFunction::AlignedStorageStore,
                     vec![
@@ -647,7 +648,7 @@ fn define_pop_back_fun(
             )
         );
 
-        gen.move_data_from_linked_storage(
+        gen.parent.move_data_from_linked_storage(
             ctx,
             elem_type,
             "linked_src".to_string(),
@@ -778,9 +779,9 @@ fn define_push_back_fun(
             ),
         );
 
-        let linked_dst_name = format!("$linked_dst_{}", gen.type_hash(ctx, elem_type));
+        let linked_dst_name = format!("$linked_dst_{}", gen.parent.type_hash(ctx, elem_type));
 
-        gen.create_and_move_data_to_linked_storage(
+        gen.parent.create_and_move_data_to_linked_storage(
             ctx,
             elem_type,
             "e".to_string(),
@@ -1046,6 +1047,97 @@ fn define_destroy_empty_fun(
 
     ctx.writer.unindent();
     emitln!(ctx.writer, "}");
+}
+
+/// Generate equality method for the vector type.
+pub(crate) fn equality_fun(gen: &mut Generator, ctx: &Context, ty: &Type) {
+    let elem_type = get_elem_type(&ty).unwrap();
+    if ctx.type_allocates_memory(&elem_type) {
+        emitln!(
+            ctx.writer,
+            "let len_x := {}",
+            gen.call_builtin_str(
+                ctx,
+                YulFunction::MemoryLoadU64,
+                std::iter::once("x".to_string())
+            )
+        );
+        emitln!(
+            ctx.writer,
+            "let len_y := {}",
+            gen.call_builtin_str(
+                ctx,
+                YulFunction::MemoryLoadU64,
+                std::iter::once("y".to_string())
+            )
+        );
+        emitln!(
+            ctx.writer,
+            "if {} {{\n  res:= false\n  leave\n}}",
+            gen.call_builtin_str(
+                ctx,
+                YulFunction::Neq,
+                vec!["len_x".to_string(), "len_y".to_string()].into_iter()
+            )
+        );
+        emitln!(
+            ctx.writer,
+            "for { let i := 0 } lt(i, len_x) { i := add(i, 1) }"
+        );
+        let elem_size = ctx.type_size(&elem_type);
+        ctx.emit_block(|| {
+            emitln!(
+                ctx.writer,
+                "let e_x := {}",
+                gen.call_builtin_str(
+                    ctx,
+                    ctx.memory_load_builtin_fun(&elem_type),
+                    std::iter::once(format!(
+                        "add({}, add(x, mul(i, {})))",
+                        VECTOR_METADATA_SIZE, elem_size
+                    ))
+                )
+            );
+            emitln!(
+                ctx.writer,
+                "let e_y := {}",
+                gen.call_builtin_str(
+                    ctx,
+                    ctx.memory_load_builtin_fun(&elem_type),
+                    std::iter::once(format!(
+                        "add({}, add(y, mul(i, {})))",
+                        VECTOR_METADATA_SIZE, elem_size
+                    ))
+                )
+            );
+            let elem_equality_call = format!("{}(e_x, e_y)", gen.equality_function(ctx, elem_type));
+            emitln!(
+                ctx.writer,
+                "if {} {{\n  res:= false\n  leave\n}}",
+                gen.call_builtin_str(
+                    ctx,
+                    YulFunction::LogicalNot,
+                    std::iter::once(elem_equality_call)
+                )
+            );
+        });
+        emitln!(ctx.writer, "res := true");
+    } else {
+        emitln!(
+            ctx.writer,
+            "res := {}",
+            gen.call_builtin_str(
+                ctx,
+                YulFunction::EqVector,
+                vec![
+                    "x".to_string(),
+                    "y".to_string(),
+                    ctx.type_size(&elem_type).to_string()
+                ]
+                .into_iter()
+            )
+        );
+    }
 }
 
 pub(crate) fn get_elem_type(vector_type: &Type) -> Option<Type> {

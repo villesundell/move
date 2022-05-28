@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 // In the informal grammar comments in this file, Comma<T> is shorthand for:
@@ -883,7 +884,10 @@ fn parse_term(context: &mut Context) -> Result<Exp, Diagnostic> {
             Exp_::Continue
         }
 
-        Tok::Identifier if context.tokens.content() == VECTOR_IDENT => {
+        Tok::Identifier
+            if context.tokens.content() == VECTOR_IDENT
+                && matches!(context.tokens.lookahead(), Ok(Tok::Less | Tok::LBracket)) =>
+        {
             consume_identifier(context.tokens, VECTOR_IDENT)?;
             let vec_end_loc = context.tokens.previous_end_loc();
             let vec_loc = make_loc(context.tokens.file_hash(), start_loc, vec_end_loc);

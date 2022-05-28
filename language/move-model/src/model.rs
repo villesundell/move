@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Provides a model for a set of Move modules (and scripts, which
@@ -1387,7 +1388,7 @@ impl GlobalEnv {
     }
 
     /// Converts a storage module id into an AST module name.
-    fn to_module_name(&self, storage_id: &language_storage::ModuleId) -> ModuleName {
+    pub fn to_module_name(&self, storage_id: &language_storage::ModuleId) -> ModuleName {
         ModuleName::from_str(
             &storage_id.address().to_string(),
             self.symbol_pool.make(storage_id.name().as_str()),

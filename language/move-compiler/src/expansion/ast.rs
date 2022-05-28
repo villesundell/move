@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -74,6 +75,8 @@ pub type Attributes = UniqueMap<AttributeName, Attribute>;
 
 #[derive(Debug, Clone)]
 pub struct Script {
+    // package name metadata from compiler arguments, not used for any language rules
+    pub package_name: Option<Symbol>,
     pub attributes: Attributes,
     pub loc: Loc,
     pub immediate_neighbors: UniqueMap<ModuleIdent, Neighbor>,
@@ -102,6 +105,8 @@ pub type ModuleIdent = Spanned<ModuleIdent_>;
 
 #[derive(Debug, Clone)]
 pub struct ModuleDefinition {
+    // package name metadata from compiler arguments, not used for any language rules
+    pub package_name: Option<Symbol>,
     pub attributes: Attributes,
     pub loc: Loc,
     pub is_source_module: bool,
@@ -854,6 +859,7 @@ impl AstDebug for Attributes {
 impl AstDebug for Script {
     fn ast_debug(&self, w: &mut AstWriter) {
         let Script {
+            package_name,
             attributes,
             loc: _loc,
             immediate_neighbors,
@@ -863,6 +869,9 @@ impl AstDebug for Script {
             function,
             specs,
         } = self;
+        if let Some(n) = package_name {
+            w.writeln(&format!("{}", n))
+        }
         attributes.ast_debug(w);
         for (mident, neighbor) in immediate_neighbors.key_cloned_iter() {
             w.write(&format!("{} {};", neighbor, mident));
@@ -887,6 +896,7 @@ impl AstDebug for Script {
 impl AstDebug for ModuleDefinition {
     fn ast_debug(&self, w: &mut AstWriter) {
         let ModuleDefinition {
+            package_name,
             attributes,
             loc: _loc,
             is_source_module,
@@ -899,6 +909,9 @@ impl AstDebug for ModuleDefinition {
             constants,
             specs,
         } = self;
+        if let Some(n) = package_name {
+            w.writeln(&format!("{}", n))
+        }
         attributes.ast_debug(w);
         w.writeln(if *is_source_module {
             "source module"

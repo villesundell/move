@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use move_binary_format::file_format::*;
@@ -170,6 +171,7 @@ fn make_module() -> CompiledModule {
                 data: AccountAddress::random().to_vec(),
             },
         ],
+        metadata: vec![],
         field_handles: vec![],
         friend_decls: vec![],
         struct_def_instantiations: vec![],

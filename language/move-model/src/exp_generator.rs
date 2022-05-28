@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use itertools::Itertools;
@@ -150,7 +151,7 @@ pub trait ExpGenerator<'env> {
 
     /// Join an iterator of boolean expressions with a boolean binary operator.
     fn mk_join_bool(&self, oper: Operation, args: impl Iterator<Item = Exp>) -> Option<Exp> {
-        args.fold1(|a, b| self.mk_bool_call(oper.clone(), vec![a, b]))
+        args.reduce(|a, b| self.mk_bool_call(oper.clone(), vec![a, b]))
     }
 
     /// Join two boolean optional expression with binary operator.

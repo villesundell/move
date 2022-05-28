@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -38,6 +39,7 @@ struct Args {
 }
 
 #[derive(Debug, Parser)]
+#[clap(author, version, about)]
 enum Command {
     #[clap(name = "bench")]
     /// Run `cargo bench`

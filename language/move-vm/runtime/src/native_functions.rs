@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -9,6 +10,7 @@ use move_core_types::{
     account_address::AccountAddress,
     gas_schedule::CostTable,
     identifier::Identifier,
+    language_storage::TypeTag,
     value::MoveTypeLayout,
     vm_status::{StatusCode, StatusType},
 };
@@ -30,9 +32,15 @@ pub fn make_table(
     addr: AccountAddress,
     elems: &[(&str, &str, NativeFunction)],
 ) -> NativeFunctionTable {
+    make_table_from_iter(addr, elems.iter().cloned())
+}
+
+pub fn make_table_from_iter<S: Into<Box<str>>>(
+    addr: AccountAddress,
+    elems: impl IntoIterator<Item = (S, S, NativeFunction)>,
+) -> NativeFunctionTable {
     elems
-        .iter()
-        .cloned()
+        .into_iter()
         .map(|(module_name, func_name, func)| {
             (
                 addr,
@@ -129,6 +137,10 @@ impl<'a, 'b> NativeContext<'a, 'b> {
 
     pub fn events(&self) -> &Vec<(Vec<u8>, u64, Type, MoveTypeLayout, Value)> {
         self.data_store.events()
+    }
+
+    pub fn type_to_type_tag(&self, ty: &Type) -> PartialVMResult<TypeTag> {
+        self.resolver.loader().type_to_type_tag(ty)
     }
 
     pub fn type_to_type_layout(&self, ty: &Type) -> PartialVMResult<Option<MoveTypeLayout>> {

@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module lays out the basic abstract costing schedule for bytecode instructions.
@@ -6,7 +7,6 @@
 //! It is important to note that the cost schedule defined in this file does not track hashing
 //! operations or other native operations; the cost of each native operation will be returned by the
 //! native function itself.
-use mirai_annotations::*;
 use serde::{Deserialize, Serialize};
 use std::{
     ops::{Add, Div, Mul, Sub},
@@ -241,13 +241,13 @@ pub struct CostTable {
 impl CostTable {
     #[inline]
     pub fn instruction_cost(&self, instr_index: u8) -> &GasCost {
-        precondition!(instr_index > 0 && instr_index <= (self.instruction_table.len() as u8));
+        debug_assert!(instr_index > 0 && instr_index <= (self.instruction_table.len() as u8));
         &self.instruction_table[(instr_index - 1) as usize]
     }
 
     #[inline]
     pub fn native_cost(&self, native_index: u8) -> &GasCost {
-        precondition!(native_index < (self.native_table.len() as u8));
+        debug_assert!(native_index < (self.native_table.len() as u8));
         &self.native_table[native_index as usize]
     }
 }

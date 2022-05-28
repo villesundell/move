@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{context::*, remove_fallthrough_jumps};
@@ -11,7 +12,10 @@ use crate::{
         ast::{self as H, Value_},
         translate::{display_var, DisplayVar},
     },
-    naming::ast::{BuiltinTypeName_, StructTypeParameter, TParam},
+    naming::{
+        ast::{BuiltinTypeName_, StructTypeParameter, TParam},
+        fake_natives,
+    },
     parser::ast::{
         Ability, Ability_, BinOp, BinOp_, ConstantName, Field, FunctionName, StructName, UnaryOp,
         UnaryOp_, Var, Visibility,
@@ -82,12 +86,24 @@ fn extract_decls(
     let context = &mut Context::new(compilation_env, None);
     let fdecls = all_modules()
         .flat_map(|(m, mdef)| {
-            mdef.functions.key_cloned_iter().map(move |(f, fdef)| {
-                let key = (m, f);
-                let seen = seen_structs(&fdef.signature);
-                let gsig = fdef.signature.clone();
-                (key, (seen, gsig))
-            })
+            mdef.functions
+                .key_cloned_iter()
+                // TODO full prover support for vector bytecode instructions
+                // TODO filter out fake natives
+                // These cannot be filtered out due to lacking prover support for the operations
+                // .filter(|(_, fdef)| {
+                //     // TODO full evm support for vector bytecode instructions
+                //     cfg!(feature = "evm-backend")
+                //         || !fdef
+                //             .attributes
+                //             .contains_key_(&fake_natives::FAKE_NATIVE_ATTR)
+                // })
+                .map(move |(f, fdef)| {
+                    let key = (m, f);
+                    let seen = seen_structs(&fdef.signature);
+                    let gsig = fdef.signature.clone();
+                    (key, (seen, gsig))
+                })
         })
         .map(|(key, (seen, gsig))| (key, (seen, function_signature(context, gsig))))
         .collect();
@@ -123,6 +139,7 @@ pub fn program(
     }
     for (key, s) in gscripts {
         let G::Script {
+            package_name,
             attributes: _attributes,
             loc: _loc,
             constants,
@@ -131,6 +148,7 @@ pub fn program(
         } = s;
         if let Some(unit) = script(
             compilation_env,
+            package_name,
             key,
             constants,
             function_name,
@@ -175,6 +193,16 @@ fn module(
     let functions = mdef
         .functions
         .into_iter()
+        // TODO full prover support for vector bytecode instructions
+        // TODO filter out fake natives
+        // These cannot be filtered out due to lacking prover support for the operations
+        // .filter(|(_, fdef)| {
+        //     // TODO full evm support for vector bytecode instructions
+        //     cfg!(feature = "evm-backend")
+        //         || !fdef
+        //             .attributes
+        //             .contains_key_(&fake_natives::FAKE_NATIVE_ATTR)
+        // })
         .map(|(f, fdef)| {
             let (res, info) = function(&mut context, Some(&ident), f, fdef);
             collected_function_infos.add(f, info).unwrap();
@@ -234,6 +262,7 @@ fn module(
     };
     let function_infos = module_function_infos(&module, &source_map, &collected_function_infos);
     let module = NamedCompiledModule {
+        package_name: mdef.package_name,
         address: addr_bytes,
         name: module_name.value(),
         module,
@@ -250,6 +279,7 @@ fn module(
 
 fn script(
     compilation_env: &mut CompilationEnv,
+    package_name: Option<Symbol>,
     key: Symbol,
     constants: UniqueMap<ConstantName, G::Constant>,
     name: FunctionName,
@@ -300,6 +330,7 @@ fn script(
     };
     let function_info = script_function_info(&source_map, info);
     let script = NamedCompiledScript {
+        package_name,
         name: key,
         script,
         source_map,
@@ -1068,8 +1099,16 @@ fn module_call(
     tys: Vec<H::BaseType>,
 ) {
     use IR::Bytecode_ as B;
-    let (m, n) = context.qualified_function_name(&mident, fname);
-    code.push(sp(loc, B::Call(m, n, base_types(context, tys))))
+    match fake_natives::resolve_builtin(&mident, &fname) {
+        // TODO full evm support for vector bytecode instructions
+        Some(mk_bytecode) if !cfg!(feature = "evm-backend") => {
+            code.push(sp(loc, mk_bytecode(base_types(context, tys))))
+        }
+        _ => {
+            let (m, n) = context.qualified_function_name(&mident, fname);
+            code.push(sp(loc, B::Call(m, n, base_types(context, tys))))
+        }
+    }
 }
 
 fn builtin(context: &mut Context, code: &mut IR::BytecodeBlock, sp!(loc, b_): H::BuiltinFunction) {

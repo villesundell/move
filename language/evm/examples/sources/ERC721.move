@@ -1,4 +1,4 @@
-#[contract]
+#[evm_contract]
 /// An implementation of the ERC-721 Non-Fungible Token Standard.
 module Evm::ERC721 {
     use Evm::Evm::{sender, self, sign, emit, isContract, tokenURI_with_baseURI};
@@ -87,10 +87,9 @@ module Evm::ERC721 {
     #[callable]
     /// Get the name.
     public fun tokenURI(tokenId: U256): String {
-        let baseURI = ASCII::string(x""); // TODO: Add a proper base URI.
-        tokenURI_with_baseURI(baseURI, tokenId)
+        let baseURI = b""; // TODO: Implement this.
+        ASCII::string(tokenURI_with_baseURI(baseURI, tokenId))
     }
-
 
     #[callable]
     /// Count all NFTs assigned to an owner.

@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::BTreeMap;
@@ -17,11 +18,8 @@ pub fn check(
     if verbose {
         println!("Checking Move files...");
     }
-    Compiler::new(
-        vec![(files, named_addresses.clone())],
-        vec![(interface_files, named_addresses)],
-    )
-    .set_flags(Flags::empty().set_sources_shadow_deps(sources_shadow_deps))
-    .check_and_report()?;
+    Compiler::from_files(files, interface_files, named_addresses)
+        .set_flags(Flags::empty().set_sources_shadow_deps(sources_shadow_deps))
+        .check_and_report()?;
     Ok(())
 }

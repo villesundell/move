@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -138,15 +139,37 @@ pub fn program(
     } = prog;
 
     context.is_source_definition = true;
-    for (named_addr_map_idx, def) in source_definitions {
-        context.named_address_mapping = Some(named_address_maps.get(named_addr_map_idx));
-        definition(&mut context, &mut source_module_map, &mut scripts, def)
+    for P::PackageDefinition {
+        package,
+        named_address_map,
+        def,
+    } in source_definitions
+    {
+        context.named_address_mapping = Some(named_address_maps.get(named_address_map));
+        definition(
+            &mut context,
+            &mut source_module_map,
+            &mut scripts,
+            package,
+            def,
+        )
     }
 
     context.is_source_definition = false;
-    for (named_addr_map_idx, def) in lib_definitions {
-        context.named_address_mapping = Some(named_address_maps.get(named_addr_map_idx));
-        definition(&mut context, &mut lib_module_map, &mut scripts, def)
+    for P::PackageDefinition {
+        package,
+        named_address_map,
+        def,
+    } in lib_definitions
+    {
+        context.named_address_mapping = Some(named_address_maps.get(named_address_map));
+        definition(
+            &mut context,
+            &mut lib_module_map,
+            &mut scripts,
+            package,
+            def,
+        )
     }
 
     for (mident, module) in lib_module_map {
@@ -199,6 +222,7 @@ fn definition(
     context: &mut Context,
     module_map: &mut UniqueMap<ModuleIdent, E::ModuleDefinition>,
     scripts: &mut Vec<E::Script>,
+    package_name: Option<Symbol>,
     def: P::Definition,
 ) {
     match def {
@@ -206,18 +230,18 @@ fn definition(
             let module_paddr = std::mem::take(&mut m.address);
             let module_addr = module_paddr
                 .map(|a| sp(a.loc, address(context, /* suggest_declaration */ true, a)));
-            module(context, module_map, module_addr, m)
+            module(context, module_map, package_name, module_addr, m)
         }
         P::Definition::Address(a) => {
             let addr = address(context, /* suggest_declaration */ false, a.addr);
             for mut m in a.modules {
                 let module_addr = check_module_address(context, a.loc, addr, &mut m);
-                module(context, module_map, Some(module_addr), m)
+                module(context, module_map, package_name, Some(module_addr), m)
             }
         }
 
         P::Definition::Script(_) if !context.is_source_definition => (),
-        P::Definition::Script(s) => script(context, scripts, s),
+        P::Definition::Script(s) => script(context, scripts, package_name, s),
     }
 }
 
@@ -326,11 +350,12 @@ fn duplicate_module(
 fn module(
     context: &mut Context,
     module_map: &mut UniqueMap<ModuleIdent, E::ModuleDefinition>,
+    package_name: Option<Symbol>,
     module_address: Option<Spanned<Address>>,
     module_def: P::ModuleDefinition,
 ) {
     assert!(context.address == None);
-    let (mident, mod_) = module_(context, module_address, module_def);
+    let (mident, mod_) = module_(context, package_name, module_address, module_def);
     if let Err((mident, old_loc)) = module_map.add(mident, mod_) {
         duplicate_module(context, module_map, mident, old_loc)
     }
@@ -362,6 +387,7 @@ fn set_sender_address(
 
 fn module_(
     context: &mut Context,
+    package_name: Option<Symbol>,
     module_address: Option<Spanned<Address>>,
     mdef: P::ModuleDefinition,
 ) -> (ModuleIdent, E::ModuleDefinition) {
@@ -377,7 +403,7 @@ fn module_(
     assert!(context.address == None);
     assert!(address == None);
     set_sender_address(context, &name, module_address);
-    let _ = check_restricted_name_all_cases(context, "module", &name.0);
+    let _ = check_restricted_name_all_cases(context, NameCase::Module, &name.0);
     if name.value().starts_with(|c| c == '_') {
         let msg = format!(
             "Invalid module name '{}'. Module names cannot start with '_'",
@@ -427,6 +453,7 @@ fn module_(
     context.set_to_outer_scope(old_aliases);
 
     let def = E::ModuleDefinition {
+        package_name,
         attributes,
         loc,
         is_source_module: context.is_source_definition,
@@ -442,11 +469,16 @@ fn module_(
     (current_module, def)
 }
 
-fn script(context: &mut Context, scripts: &mut Vec<E::Script>, pscript: P::Script) {
-    scripts.push(script_(context, pscript))
+fn script(
+    context: &mut Context,
+    scripts: &mut Vec<E::Script>,
+    package_name: Option<Symbol>,
+    pscript: P::Script,
+) {
+    scripts.push(script_(context, package_name, pscript))
 }
 
-fn script_(context: &mut Context, pscript: P::Script) -> E::Script {
+fn script_(context: &mut Context, package_name: Option<Symbol>, pscript: P::Script) -> E::Script {
     assert!(context.address == None);
     assert!(context.is_source_definition);
     let P::Script {
@@ -505,6 +537,7 @@ fn script_(context: &mut Context, pscript: P::Script) -> E::Script {
     context.set_to_outer_scope(old_aliases);
 
     E::Script {
+        package_name,
         attributes,
         loc,
         immediate_neighbors: UniqueMap::new(),
@@ -639,10 +672,15 @@ fn all_module_members<'a>(
     named_addr_maps: &NamedAddressMaps,
     members: &mut UniqueMap<ModuleIdent, ModuleMembers>,
     always_add: bool,
-    defs: impl IntoIterator<Item = &'a (NamedAddressMapIndex, P::Definition)>,
+    defs: impl IntoIterator<Item = &'a P::PackageDefinition>,
 ) {
-    for (named_addr_map_index, def) in defs {
-        let named_addr_map = named_addr_maps.get(*named_addr_map_index);
+    for P::PackageDefinition {
+        named_address_map,
+        def,
+        ..
+    } in defs
+    {
+        let named_addr_map = named_addr_maps.get(*named_address_map);
         match def {
             P::Definition::Module(m) => {
                 let addr = match &m.address {
@@ -831,7 +869,8 @@ fn use_(context: &mut Context, acc: &mut AliasMapBuilder, u: P::UseDecl) {
     macro_rules! add_module_alias {
         ($ident:expr, $alias_opt:expr) => {{
             let alias: Name = $alias_opt.unwrap_or_else(|| $ident.value.module.0.clone());
-            if let Err(()) = check_restricted_name_all_cases(context, "module alias", &alias) {
+            if let Err(()) = check_restricted_name_all_cases(context, NameCase::ModuleAlias, &alias)
+            {
                 return;
             }
 
@@ -1533,12 +1572,12 @@ fn name_access_chain(
         (Access::ApplyPositional, PN::One(n))
         | (Access::ApplyNamed, PN::One(n))
         | (Access::Type, PN::One(n)) => match context.aliases.member_alias_get(&n) {
-            Some((mident, mem)) => EN::ModuleAccess(*mident, *mem),
+            Some((mident, mem)) => EN::ModuleAccess(mident, mem),
             None => EN::Name(n),
         },
         (Access::Term, PN::One(n)) if is_valid_struct_constant_or_schema_name(n.value.as_str()) => {
             match context.aliases.member_alias_get(&n) {
-                Some((mident, mem)) => EN::ModuleAccess(*mident, *mem),
+                Some((mident, mem)) => EN::ModuleAccess(mident, mem),
                 None => EN::Name(n),
             }
         }
@@ -1558,7 +1597,7 @@ fn name_access_chain(
                 ));
                 return None;
             }
-            Some(mident) => EN::ModuleAccess(*mident, n2),
+            Some(mident) => EN::ModuleAccess(mident, n2),
         },
         (_, PN::Three(sp!(ident_loc, (ln, n2)), n3)) => {
             let addr = address(context, /* suggest_declaration */ false, ln);
@@ -1583,7 +1622,7 @@ fn name_access_chain_to_module_ident(
                 ));
                 None
             }
-            Some(mident) => Some(*mident),
+            Some(mident) => Some(mident),
         },
         PN::Two(ln, n) => {
             let pmident_ = P::ModuleIdent_ {
@@ -2399,7 +2438,7 @@ fn check_valid_address_name_(
     use P::LeadingNameAccess_ as LN;
     match ln_ {
         LN::AnonymousAddress(_) => Ok(()),
-        LN::Name(n) => check_restricted_name_all_cases_(env, "address", n),
+        LN::Name(n) => check_restricted_name_all_cases_(env, NameCase::Address, n),
     }
 }
 
@@ -2417,7 +2456,7 @@ fn check_valid_local_name(context: &mut Context, v: &Var) {
             .env
             .add_diag(diag!(Declarations::InvalidName, (v.loc(), msg)));
     }
-    let _ = check_restricted_name_all_cases(context, "variable", &v.0);
+    let _ = check_restricted_name_all_cases(context, NameCase::Variable, &v.0);
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -2429,12 +2468,44 @@ enum ModuleMemberKind {
 }
 
 impl ModuleMemberKind {
-    pub fn case(&self) -> &'static str {
+    fn case(self) -> NameCase {
         match self {
-            ModuleMemberKind::Function => "function",
-            ModuleMemberKind::Constant => "constant",
-            ModuleMemberKind::Struct => "struct",
-            ModuleMemberKind::Schema => "schema",
+            ModuleMemberKind::Constant => NameCase::Constant,
+            ModuleMemberKind::Function => NameCase::Function,
+            ModuleMemberKind::Struct => NameCase::Struct,
+            ModuleMemberKind::Schema => NameCase::Schema,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum NameCase {
+    Constant,
+    Function,
+    Struct,
+    Schema,
+    Module,
+    ModuleMemberAlias(ModuleMemberKind),
+    ModuleAlias,
+    Variable,
+    Address,
+}
+
+impl NameCase {
+    const fn name(&self) -> &'static str {
+        match self {
+            NameCase::Constant => "constant",
+            NameCase::Function => "function",
+            NameCase::Struct => "struct",
+            NameCase::Schema => "schema",
+            NameCase::Module => "module",
+            NameCase::ModuleMemberAlias(ModuleMemberKind::Function) => "function alias",
+            NameCase::ModuleMemberAlias(ModuleMemberKind::Constant) => "constant alias",
+            NameCase::ModuleMemberAlias(ModuleMemberKind::Struct) => "struct alias",
+            NameCase::ModuleMemberAlias(ModuleMemberKind::Schema) => "schema alias",
+            NameCase::ModuleAlias => "module alias",
+            NameCase::Variable => "variable",
+            NameCase::Address => "address",
         }
     }
 }
@@ -2459,7 +2530,7 @@ fn check_valid_module_member_alias(
         context,
         member,
         &alias,
-        &format!("{} alias", member.case()),
+        NameCase::ModuleMemberAlias(member),
     ) {
         Err(()) => None,
         Ok(()) => Some(alias),
@@ -2470,7 +2541,7 @@ fn check_valid_module_member_name_impl(
     context: &mut Context,
     member: ModuleMemberKind,
     n: &Name,
-    case: &str,
+    case: NameCase,
 ) -> Result<(), ()> {
     use ModuleMemberKind as M;
     fn upper_first_letter(s: &str) -> String {
@@ -2480,15 +2551,14 @@ fn check_valid_module_member_name_impl(
             Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
         }
     }
-    let lcase = case;
     match member {
         M::Function => {
             if n.value.starts_with(|c| c == '_') {
                 let msg = format!(
                     "Invalid {} name '{}'. {} names cannot start with '_'",
-                    lcase,
+                    case.name(),
                     n,
-                    upper_first_letter(case),
+                    upper_first_letter(case.name()),
                 );
                 context
                     .env
@@ -2500,9 +2570,9 @@ fn check_valid_module_member_name_impl(
             if !is_valid_struct_constant_or_schema_name(&n.value) {
                 let msg = format!(
                     "Invalid {} name '{}'. {} names must start with 'A'..'Z'",
-                    lcase,
+                    case.name(),
                     n,
-                    upper_first_letter(case),
+                    upper_first_letter(case.name()),
                 );
                 context
                     .env
@@ -2515,20 +2585,20 @@ fn check_valid_module_member_name_impl(
     // TODO move these names to a more central place?
     check_restricted_names(
         context,
-        lcase,
+        case,
         n,
         crate::naming::ast::BuiltinFunction_::all_names(),
     )?;
     check_restricted_names(
         context,
-        lcase,
+        case,
         n,
         crate::naming::ast::BuiltinTypeName_::all_names(),
     )?;
 
     // Restricting Self for now in the case where we ever have impls
     // Otherwise, we could allow it
-    check_restricted_name_all_cases(context, lcase, n)?;
+    check_restricted_name_all_cases(context, case, n)?;
 
     Ok(())
 }
@@ -2539,17 +2609,24 @@ pub fn is_valid_struct_constant_or_schema_name(s: &str) -> bool {
 
 // Checks for a restricted name in any decl case
 // Self and vector are not allowed
-fn check_restricted_name_all_cases(context: &mut Context, case: &str, n: &Name) -> Result<(), ()> {
+fn check_restricted_name_all_cases(
+    context: &mut Context,
+    case: NameCase,
+    n: &Name,
+) -> Result<(), ()> {
     check_restricted_name_all_cases_(context.env, case, n)
 }
 
 fn check_restricted_name_all_cases_(
     env: &mut CompilationEnv,
-    case: &str,
+    case: NameCase,
     n: &Name,
 ) -> Result<(), ()> {
     let n_str = n.value.as_str();
-    if n_str == ModuleName::SELF_NAME || n_str == crate::naming::ast::BuiltinTypeName_::VECTOR {
+    let can_be_vector = matches!(case, NameCase::Module | NameCase::ModuleAlias);
+    if n_str == ModuleName::SELF_NAME
+        || (!can_be_vector && n_str == crate::naming::ast::BuiltinTypeName_::VECTOR)
+    {
         env.add_diag(restricted_name_error(case, n.loc, n_str));
         Err(())
     } else {
@@ -2559,7 +2636,7 @@ fn check_restricted_name_all_cases_(
 
 fn check_restricted_names(
     context: &mut Context,
-    case: &str,
+    case: NameCase,
     sp!(loc, n_): &Name,
     all_names: &BTreeSet<Symbol>,
 ) -> Result<(), ()> {
@@ -2571,8 +2648,8 @@ fn check_restricted_names(
     }
 }
 
-fn restricted_name_error(case: &str, loc: Loc, restricted: &str) -> Diagnostic {
-    let a_or_an = match case.chars().next().unwrap() {
+fn restricted_name_error(case: NameCase, loc: Loc, restricted: &str) -> Diagnostic {
+    let a_or_an = match case.name().chars().next().unwrap() {
         // TODO this is not exhaustive to the indefinite article rules in English
         // but 'case' is never user generated, so it should be okay for a while/forever...
         'a' | 'e' | 'i' | 'o' | 'u' => "an",
@@ -2582,7 +2659,7 @@ fn restricted_name_error(case: &str, loc: Loc, restricted: &str) -> Diagnostic {
         "Invalid {case} name '{restricted}'. '{restricted}' is restricted and cannot be used to \
          name {a_or_an} {case}",
         a_or_an = a_or_an,
-        case = case,
+        case = case.name(),
         restricted = restricted,
     );
     diag!(NameResolution::ReservedName, (loc, msg))

@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use codespan_reporting::{diagnostic::Severity, term::termcolor::Buffer};
@@ -17,6 +18,8 @@ use crate::{
     solidity_ty::SoliditySignature, yul_functions::YulFunction, Options,
 };
 
+use crate::context::Contract;
+use move_model::model::{ModuleEnv, StructId};
 use sha3::{Digest, Keccak256};
 
 /// Mutable state of the generator.
@@ -24,6 +27,8 @@ use sha3::{Digest, Keccak256};
 pub struct Generator {
     // Location of the currently compiled contract, for general error messages.
     pub(crate) contract_loc: Loc,
+    // If the currently compiled contract has a storage type, its contained here.
+    pub(crate) storage_type: Option<QualifiedInstId<StructId>>,
     /// Move functions, including type instantiation, needed in the currently generated code block.
     needed_move_functions: Vec<QualifiedInstId<FunId>>,
     /// Move functions for which code has been emitted.
@@ -48,25 +53,25 @@ type AuxilaryFunctionGenerator = dyn FnOnce(&mut Generator, &Context);
 // Entry point
 
 impl Generator {
-    /// Run the generator and produce a pair of contract name and Yul contract object.
-    pub fn run(options: &Options, env: &GlobalEnv) -> (String, String, String) {
-        let ctx = Context::new(options, env, false);
-        let mut gen = Generator::default();
-        let contract_funs = ctx.get_target_functions(attributes::is_contract_fun);
-        let (contract_name, contract_loc) = if contract_funs.is_empty() {
-            ("Empty".to_string(), env.unknown_loc())
-        } else {
-            // Use the module of the first function to determine contract name and location.
-            // TODO: we want to make the contract name configurable by options
-            let first_module = &contract_funs[0].module_env;
-            (ctx.make_contract_name(first_module), env.unknown_loc())
-        };
-        gen.contract_object(&ctx, contract_loc, &contract_name, &contract_funs);
-        (
-            contract_name,
-            ctx.writer.extract_result(),
-            ctx.abi_writer.extract_result(),
-        )
+    /// Run the generator and produce a lisy of triples of contract name, Yul contract object, and ABI.
+    pub fn run(options: &Options, env: &GlobalEnv) -> Vec<(String, String, String)> {
+        let mut res = vec![];
+        let ctx = &Context::new(options, env, false);
+        for contract in ctx.derive_contracts() {
+            let module = &ctx.env.get_module(contract.module);
+            if !module.is_target() {
+                // Ignore contract from module not target of compilation
+                continue;
+            }
+            let mut gen = Generator::default();
+            gen.contract_object(ctx, &contract);
+            res.push((
+                contract.name,
+                ctx.writer.extract_result(),
+                ctx.abi_writer.extract_result(),
+            ))
+        }
+        res
     }
 
     // Run the generator for evm unit tests and produce a mapping from function id to Yul test object.
@@ -131,22 +136,21 @@ impl Generator {
 
 impl Generator {
     /// Generate contract object for given contract functions.
-    fn contract_object(
-        &mut self,
-        ctx: &Context,
-        contract_loc: Loc,
-        contract_name: &str,
-        contract_funs: &[FunctionEnv<'_>],
-    ) {
+    fn contract_object(&mut self, ctx: &Context, contract: &Contract) {
         self.header(ctx);
         // Initialize contract specific state
-        self.contract_loc = contract_loc;
-        emit!(ctx.writer, "object \"{}\" ", contract_name);
+        let module = &ctx.env.get_module(contract.module);
+        self.contract_loc = module.get_loc();
+        self.storage_type = contract
+            .storage
+            .map(|struct_id| contract.module.qualified_inst(struct_id, vec![]));
+        // Start generating Yul object.
+        emit!(ctx.writer, "object \"{}\" ", contract.name);
         ctx.emit_block(|| {
             // Generate the deployment code block
             self.begin_code_block(ctx);
-            self.optional_creator(ctx, contract_name);
-            let contract_deployed_name = format!("{}_deployed", contract_name);
+            self.optional_create(ctx, module, contract);
+            let contract_deployed_name = format!("{}_deployed", contract.name);
             emitln!(
                 ctx.writer,
                 "codecopy(0, dataoffset(\"{}\"), datasize(\"{}\"))",
@@ -168,7 +172,14 @@ impl Generator {
                     ctx.writer,
                     "mstore(${MEM_SIZE_LOC}, memoryguard(${USED_MEM}))"
                 );
-                self.callable_functions(ctx, contract_funs);
+                let callables = contract
+                    .callables
+                    .iter()
+                    .map(|f| module.get_function(*f))
+                    .collect_vec();
+                let receiver = contract.receive.map(|f| module.get_function(f));
+                let fallback = contract.fallback.map(|f| module.get_function(f));
+                self.callable_functions(ctx, &callables, receiver, fallback);
                 self.end_code_block(ctx);
             })
         });
@@ -323,20 +334,26 @@ impl Generator {
     }
 
     /// Generate optional creator (contract constructor).
-    fn optional_creator(&mut self, ctx: &Context, contract_name: &str) {
-        let mut creators = ctx.get_target_functions(attributes::is_create_fun);
-        if creators.len() > 1 {
-            ctx.env
-                .error(&creators[1].get_loc(), "multiple #[create] functions")
-        }
-        if let Some(creator) = creators.pop() {
+    fn optional_create(&mut self, ctx: &Context, module: &ModuleEnv, contract: &Contract) {
+        if let Some(creator_id) = contract.constructor {
+            let creator = module.get_function(creator_id);
             ctx.check_no_generics(&creator);
-            if creator.get_return_count() > 0 {
+            if let Some(storage) = &self.storage_type {
+                // The creator function must return a value of the storage type.
+                let storage_ty = storage.to_type();
+                if creator.get_return_count() != 1 || creator.get_return_type(0) != storage_ty {
+                    ctx.env.error(
+                        &creator.get_loc(),
+                        &format!("creator function for contract with #[storage] must return value of type `{}`", storage_ty.display(&ctx.env.get_type_display_ctx()))
+                    )
+                }
+            } else if creator.get_return_count() > 0 {
                 ctx.env.error(
                     &creator.get_loc(),
-                    "return values not allowed for creator functions",
+                    "return values not allowed for creator functions without specified #[storage]",
                 )
             }
+
             if !self.is_suitable_for_dispatch(ctx, &creator) {
                 ctx.env.error(
                     &creator.get_loc(),
@@ -364,7 +381,7 @@ impl Generator {
                     ctx.writer,
                     "let {} := datasize(\"{}\")",
                     program_size_str,
-                    contract_name
+                    contract.name
                 );
                 emitln!(
                     ctx.writer,
@@ -410,16 +427,49 @@ impl Generator {
             }
 
             // Call the function
-            emitln!(ctx.writer, "{}({})", function_name, params);
+            if let Some(storage_id) = contract.storage {
+                // The creator function returns a value which we need to store as
+                // a resource.
+                emitln!(
+                    ctx.writer,
+                    "let $new_value := {}({})",
+                    function_name,
+                    params
+                );
+                let storage = module.get_id().qualified_inst(storage_id, vec![]);
+                self.move_to_addr(
+                    ctx,
+                    storage,
+                    "address()".to_string(),
+                    "$new_value".to_string(),
+                );
+            } else {
+                // Otherwise the creator function is responsible to store initialized data itself.
+                emitln!(ctx.writer, "{}({})", function_name, params);
+            }
 
             self.need_move_function(&fun_id);
         }
     }
 
     /// Generate Yul definitions for all callable functions.
-    fn callable_functions(&mut self, ctx: &Context, contract_funs: &[FunctionEnv<'_>]) {
-        self.generate_dispatcher_routine(ctx, contract_funs);
-        for fun in contract_funs {
+    fn callable_functions(
+        &mut self,
+        ctx: &Context,
+        callables: &[FunctionEnv<'_>],
+        receiver: Option<FunctionEnv<'_>>,
+        fallback: Option<FunctionEnv<'_>>,
+    ) {
+        self.generate_dispatcher_routine(ctx, callables, &receiver, &fallback);
+        for fun in callables {
+            ctx.check_no_generics(fun);
+            self.function(ctx, &fun.get_qualified_id().instantiate(vec![]))
+        }
+        if let Some(fun) = &receiver {
+            ctx.check_no_generics(fun);
+            self.function(ctx, &fun.get_qualified_id().instantiate(vec![]))
+        }
+        if let Some(fun) = &fallback {
             ctx.check_no_generics(fun);
             self.function(ctx, &fun.get_qualified_id().instantiate(vec![]))
         }
@@ -549,6 +599,26 @@ impl Generator {
         }
     }
 
+    pub(crate) fn equality_function(&mut self, ctx: &Context, ty: Type) -> String {
+        let function_name = format!("$Eq_{}", ctx.mangle_types(&[ty.clone()]));
+        if ctx.type_allocates_memory(&ty) {
+            let generate_fun = move |gen: &mut Generator, ctx: &Context| {
+                emitln!(ctx.writer, "(x, y) -> res");
+                ctx.emit_block(|| {
+                    if ty.is_vector() {
+                        crate::vectors::equality_fun(gen, ctx, &ty)
+                    } else if ctx.type_is_struct(&ty) {
+                        struct_equality_fun(gen, ctx, &ty)
+                    }
+                });
+            };
+            self.need_auxiliary_function(function_name, Box::new(generate_fun))
+        } else {
+            self.need_yul_function(YulFunction::Eq);
+            YulFunction::Eq.yule_name()
+        }
+    }
+
     /// Copy literal string to memory
     pub(crate) fn copy_literal_to_memory(&mut self, value: Vec<u8>) -> String {
         let name_prefix = "copy_literal_string_to_memory";
@@ -577,4 +647,114 @@ impl Generator {
         let digest = keccak.finalize();
         u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]])
     }
+
+    pub(crate) fn type_storage_base(
+        &mut self,
+        ctx: &Context,
+        ty: &Type,
+        category: &str,
+        instance: String,
+    ) -> String {
+        let hash = self.type_hash(ctx, ty);
+        self.call_builtin_str(
+            ctx,
+            YulFunction::MakeTypeStorageBase,
+            vec![category.to_string(), format!("0x{:x}", hash), instance].into_iter(),
+        )
+    }
+
+    /// Derive a 4 byte hash for a type. If this hash creates a collision in the current
+    /// contract, create an error.
+    pub(crate) fn type_hash(&mut self, ctx: &Context, ty: &Type) -> u32 {
+        let sig = ctx.mangle_type(ty);
+        let mut keccak = Keccak256::new();
+        keccak.update(sig.as_bytes());
+        let digest = keccak.finalize();
+        let hash = u32::from_le_bytes([digest[0], digest[1], digest[2], digest[3]]);
+        if let Some(old_ty) = self.type_sig_map.insert(hash, ty.clone()) {
+            if old_ty != *ty {
+                let ty_ctx = &ctx.env.get_type_display_ctx();
+                ctx.env.error(
+                    &self.contract_loc,
+                    &format!(
+                        "collision of type hash for types `{}` and `{}`\n\
+                         (resolution via attribute not yet implemented)",
+                        ty.display(ty_ctx),
+                        old_ty.display(ty_ctx)
+                    ),
+                )
+            }
+        }
+        hash
+    }
+}
+
+fn struct_equality_fun(gen: &mut Generator, ctx: &Context, ty: &Type) {
+    let struct_id = ty.get_struct_id(ctx.env).expect("struct");
+    let layout = ctx.get_struct_layout(&struct_id);
+
+    // Check pointer equality of fields first.
+    for field_offs in layout.field_order.iter().take(layout.pointer_count) {
+        let (byte_offs, field_ty) = layout.offsets.get(field_offs).unwrap();
+
+        emitln!(
+            ctx.writer,
+            "let f_x_{} := mload({})",
+            field_offs,
+            format!("add(x, {})", byte_offs)
+        );
+
+        emitln!(
+            ctx.writer,
+            "let f_y_{} := mload({})",
+            field_offs,
+            format!("add(y, {})", byte_offs)
+        );
+        let field_equality_call = format!(
+            "{}(f_x_{}, f_y_{})",
+            gen.equality_function(ctx, field_ty.clone()),
+            field_offs,
+            field_offs
+        );
+        emitln!(
+            ctx.writer,
+            "if {} {{\n  res:= false\n  leave\n}}",
+            gen.call_builtin_str(
+                ctx,
+                YulFunction::LogicalNot,
+                std::iter::once(field_equality_call)
+            )
+        );
+    }
+
+    // The remaining fields are all primitive. We directly check the memory content.
+    if layout.pointer_count < layout.field_order.len() {
+        let mut byte_offs = layout
+            .offsets
+            .get(&layout.field_order[layout.pointer_count])
+            .unwrap()
+            .0;
+        assert_eq!(
+            byte_offs % 32,
+            0,
+            "first non-pointer field on word boundary"
+        );
+        while byte_offs < layout.size {
+            emitln!(
+                ctx.writer,
+                "if {} {{\n  res:= false\n  leave\n}}",
+                gen.call_builtin_str(
+                    ctx,
+                    YulFunction::Neq,
+                    vec![
+                        format!("mload(add(x, {}))", byte_offs),
+                        format!("mload(add(y, {}))", byte_offs)
+                    ]
+                    .into_iter()
+                )
+            );
+            byte_offs += 32
+        }
+    }
+    emitln!(ctx.writer, "res := true");
 }

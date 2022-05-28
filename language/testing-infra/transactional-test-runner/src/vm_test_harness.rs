@@ -1,11 +1,12 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{collections::BTreeMap, path::Path};
 
 use crate::{
     framework::{run_test_impl, CompiledState, MoveTestAdapter},
-    tasks::{EmptyCommand, InitCommand, RawAddress, SyntaxChoice, TaskInput},
+    tasks::{EmptyCommand, InitCommand, SyntaxChoice, TaskInput},
 };
 use anyhow::{anyhow, Result};
 use move_binary_format::{
@@ -13,14 +14,17 @@ use move_binary_format::{
     file_format::CompiledScript,
     CompiledModule,
 };
-use move_command_line_common::files::verify_and_create_named_address_mapping;
-use move_compiler::{compiled_unit::AnnotatedCompiledUnit, FullyCompiledProgram};
+use move_command_line_common::{
+    address::ParsedAddress, files::verify_and_create_named_address_mapping,
+};
+use move_compiler::{
+    compiled_unit::AnnotatedCompiledUnit, shared::PackagePaths, FullyCompiledProgram,
+};
 use move_core_types::{
     account_address::AccountAddress,
     identifier::{IdentStr, Identifier},
     language_storage::{ModuleId, StructTag, TypeTag},
     resolver::MoveResolver,
-    transaction_argument::{convert_txn_args, TransactionArgument},
     value::MoveValue,
 };
 use move_resource_viewer::MoveValueAnnotator;
@@ -67,6 +71,7 @@ pub fn view_resource_in_move_storage(
 impl<'a> MoveTestAdapter<'a> for SimpleVMTestAdapter<'a> {
     type ExtraInitArgs = EmptyCommand;
     type ExtraPublishArgs = EmptyCommand;
+    type ExtraValueArgs = ();
     type ExtraRunArgs = EmptyCommand;
     type Subcommand = EmptyCommand;
 
@@ -82,7 +87,7 @@ impl<'a> MoveTestAdapter<'a> for SimpleVMTestAdapter<'a> {
         default_syntax: SyntaxChoice,
         pre_compiled_deps: Option<&'a FullyCompiledProgram>,
         task_opt: Option<TaskInput<(InitCommand, EmptyCommand)>>,
-    ) -> Self {
+    ) -> (Self, Option<String>) {
         let additional_mapping = match task_opt.map(|t| t.command) {
             Some((InitCommand { named_addresses }, _)) => {
                 verify_and_create_named_address_mapping(named_addresses).unwrap()
@@ -101,7 +106,7 @@ impl<'a> MoveTestAdapter<'a> for SimpleVMTestAdapter<'a> {
             named_address_mapping.insert(name, addr);
         }
         let mut adapter = Self {
-            compiled_state: CompiledState::new(named_address_mapping, pre_compiled_deps),
+            compiled_state: CompiledState::new(named_address_mapping, pre_compiled_deps, None),
             default_syntax,
             storage: InMemoryStorage::new(),
         };
@@ -135,7 +140,7 @@ impl<'a> MoveTestAdapter<'a> for SimpleVMTestAdapter<'a> {
                 .compiled_state
                 .add_and_generate_interface_file(module.clone());
         }
-        adapter
+        (adapter, None)
     }
 
     fn publish_module(
@@ -144,30 +149,30 @@ impl<'a> MoveTestAdapter<'a> for SimpleVMTestAdapter<'a> {
         _named_addr_opt: Option<Identifier>,
         gas_budget: Option<u64>,
         _extra_args: Self::ExtraPublishArgs,
-    ) -> Result<()> {
+    ) -> Result<(Option<String>, CompiledModule)> {
         let mut module_bytes = vec![];
         module.serialize(&mut module_bytes)?;
 
         let id = module.self_id();
         let sender = *id.address();
-        self.perform_session_action(gas_budget, |session, gas_status| {
+        match self.perform_session_action(gas_budget, |session, gas_status| {
             session.publish_module(module_bytes, sender, gas_status)
-        })
-        .map_err(|e| {
-            anyhow!(
+        }) {
+            Ok(()) => Ok((None, module)),
+            Err(e) => Err(anyhow!(
                 "Unable to publish module '{}'. Got VMError: {}",
                 module.self_id(),
                 format_vm_error(&e)
-            )
-        })
+            )),
+        }
     }
 
     fn execute_script(
         &mut self,
         script: CompiledScript,
         type_args: Vec<TypeTag>,
-        signers: Vec<RawAddress>,
-        txn_args: Vec<TransactionArgument>,
+        signers: Vec<ParsedAddress>,
+        txn_args: Vec<MoveValue>,
         gas_budget: Option<u64>,
         _extra_args: Self::ExtraRunArgs,
     ) -> Result<(Option<String>, SerializedReturnValues)> {
@@ -179,7 +184,10 @@ impl<'a> MoveTestAdapter<'a> for SimpleVMTestAdapter<'a> {
         let mut script_bytes = vec![];
         script.serialize(&mut script_bytes)?;
 
-        let args = convert_txn_args(&txn_args);
+        let args = txn_args
+            .iter()
+            .map(|arg| arg.simple_serialize().unwrap())
+            .collect::<Vec<_>>();
         // TODO rethink testing signer args
         let args = signers
             .iter()
@@ -204,8 +212,8 @@ impl<'a> MoveTestAdapter<'a> for SimpleVMTestAdapter<'a> {
         module: &ModuleId,
         function: &IdentStr,
         type_args: Vec<TypeTag>,
-        signers: Vec<RawAddress>,
-        txn_args: Vec<TransactionArgument>,
+        signers: Vec<ParsedAddress>,
+        txn_args: Vec<MoveValue>,
         gas_budget: Option<u64>,
         _extra_args: Self::ExtraRunArgs,
     ) -> Result<(Option<String>, SerializedReturnValues)> {
@@ -214,7 +222,10 @@ impl<'a> MoveTestAdapter<'a> for SimpleVMTestAdapter<'a> {
             .map(|addr| self.compiled_state().resolve_address(&addr))
             .collect();
 
-        let args = convert_txn_args(&txn_args);
+        let args = txn_args
+            .iter()
+            .map(|arg| arg.simple_serialize().unwrap())
+            .collect::<Vec<_>>();
         // TODO rethink testing signer args
         let args = signers
             .iter()
@@ -305,10 +316,11 @@ impl<'a> SimpleVMTestAdapter<'a> {
 
 static PRECOMPILED_MOVE_STDLIB: Lazy<FullyCompiledProgram> = Lazy::new(|| {
     let program_res = move_compiler::construct_pre_compiled_lib(
-        vec![(
-            move_stdlib::move_stdlib_files(),
-            move_stdlib::move_stdlib_named_addresses(),
-        )],
+        vec![PackagePaths {
+            name: None,
+            paths: move_stdlib::move_stdlib_files(),
+            named_address_map: move_stdlib::move_stdlib_named_addresses(),
+        }],
         None,
         move_compiler::Flags::empty(),
     )
@@ -323,12 +335,10 @@ static PRECOMPILED_MOVE_STDLIB: Lazy<FullyCompiledProgram> = Lazy::new(|| {
 });
 
 static MOVE_STDLIB_COMPILED: Lazy<Vec<CompiledModule>> = Lazy::new(|| {
-    let (files, units_res) = move_compiler::Compiler::new(
-        vec![(
-            move_stdlib::move_stdlib_files(),
-            move_stdlib::move_stdlib_named_addresses(),
-        )],
+    let (files, units_res) = move_compiler::Compiler::from_files(
+        move_stdlib::move_stdlib_files(),
         vec![],
+        move_stdlib::move_stdlib_named_addresses(),
     )
     .build()
     .unwrap();

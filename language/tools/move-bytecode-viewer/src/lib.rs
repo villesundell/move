@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -20,10 +21,7 @@ pub mod tui;
 pub mod viewer;
 
 #[derive(Debug, Parser)]
-#[clap(
-    name = "Move Bytecode Explorer",
-    about = "Explore Move bytecode and how the source code compiles to it"
-)]
+#[clap(author, version, about)]
 pub struct BytecodeViewerConfig {
     /// The path to the module binary
     #[clap(long = "module-path", short = 'b')]

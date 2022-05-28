@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -244,7 +245,7 @@ impl ModuleCache {
             let mut field_tys = vec![];
             for field in fields {
                 let ty = self.make_type_while_loading(module, &field.signature.0)?;
-                assume!(field_tys.len() < usize::max_value());
+                debug_assert!(field_tys.len() < usize::max_value());
                 field_tys.push(ty);
             }
 

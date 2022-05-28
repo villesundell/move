@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -22,7 +23,7 @@ use std::{
 };
 
 #[derive(Debug, Parser)]
-#[clap(name = "IR Compiler", about = "Move IR to bytecode compiler.")]
+#[clap(author, version, about)]
 struct Args {
     /// Treat input file as a module (default is to treat file as a script)
     #[clap(short = 'm', long = "module")]

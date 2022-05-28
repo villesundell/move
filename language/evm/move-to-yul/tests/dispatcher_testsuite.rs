@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Result;
@@ -9,7 +10,7 @@ use move_to_yul::{generator::Generator, options::Options};
 use primitive_types::{H160, U256};
 use std::path::{Path, PathBuf};
 
-use move_compiler::shared::NumericalAddress;
+use move_compiler::shared::{NumericalAddress, PackagePaths};
 use move_stdlib::move_stdlib_named_addresses;
 
 pub const DISPATCHER_TESTS_LOCATION: &str = "tests/test-dispatcher";
@@ -46,25 +47,32 @@ fn compile_yul_to_bytecode_bytes(filename: &str) -> Result<Vec<u8>> {
         path_from_crate_root("../stdlib/sources"),
         path_from_crate_root("../../move-stdlib/sources"),
     ];
-    let mut named_address_mapping = move_stdlib_named_addresses();
-    named_address_mapping.insert(
+    let mut named_address_map = move_stdlib_named_addresses();
+    named_address_map.insert(
         "Std".to_string(),
         NumericalAddress::parse_str("0x1").unwrap(),
     );
-    named_address_mapping.insert(
+    named_address_map.insert(
         "Evm".to_string(),
         NumericalAddress::parse_str("0x2").unwrap(),
     );
     let env = run_model_builder_with_options(
-        vec![(
-            vec![contract_path(filename).to_string_lossy().to_string()],
-            named_address_mapping.clone(),
-        )],
-        vec![(deps, named_address_mapping)],
+        vec![PackagePaths {
+            name: None,
+            paths: vec![contract_path(filename).to_string_lossy().to_string()],
+            named_address_map: named_address_map.clone(),
+        }],
+        vec![PackagePaths {
+            name: None,
+            paths: deps,
+            named_address_map,
+        }],
         ModelBuilderOptions::default(),
     )?;
     let options = Options::default();
-    let (_, out, _) = Generator::run(&options, &env);
+    let (_, out, _) = Generator::run(&options, &env)
+        .pop()
+        .expect("not contract in test case");
     let (bc, _) = compile::solc_yul(&out, false)?;
     Ok(bc)
 }
@@ -87,6 +95,30 @@ fn test_dispatch_basic() -> Result<()> {
         let mut expected = [0u8; 32];
         expected[31] = i;
         assert_eq!(&buffer[..32], &expected);
+    }
+    Ok(())
+}
+
+/// Test DispatcherBasicStorage
+#[test]
+fn test_dispatch_basic_storage() -> Result<()> {
+    let contract_code = compile_yul_to_bytecode_bytes("DispatcherBasicStorage.move")?;
+    let vicinity = generate_testing_vincinity();
+    let mut exec = Executor::new(&vicinity);
+    let contract_address = exec
+        .create_contract(H160::zero(), contract_code)
+        .expect("failed to create contract");
+    let current = "current()";
+    let increment = "increment()";
+    for i in 0..3 {
+        let (exit_reason, buffer) =
+            exec.call_function(H160::zero(), contract_address, 0.into(), current, &[]);
+        assert!(matches!(exit_reason, ExitReason::Succeed(_)));
+        assert!(buffer.len() >= 32);
+        assert_eq!(&buffer[31], &(i as u8));
+        let (exit_reason, _) =
+            exec.call_function(H160::zero(), contract_address, 0.into(), increment, &[]);
+        assert!(matches!(exit_reason, ExitReason::Succeed(_)));
     }
     Ok(())
 }

@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -9,6 +10,7 @@ use crate::{
     NativeFunctionRecord,
 };
 use anyhow::{bail, Result};
+use move_command_line_common::env::get_bytecode_version_from_env;
 use move_core_types::gas_schedule::CostTable;
 use move_package::compilation::compiled_package::CompiledPackage;
 use move_vm_runtime::move_vm::MoveVM;
@@ -27,13 +29,13 @@ pub fn publish(
     if verbose {
         println!(
             "Found {} modules",
-            package.modules()?.collect::<Vec<_>>().len()
+            package.root_modules().collect::<Vec<_>>().len()
         );
     }
 
     if no_republish {
         let republished = package
-            .modules()?
+            .root_modules()
             .filter_map(|unit| {
                 let id = module(&unit.unit).ok()?.self_id();
                 if state.has_module(&id) {
@@ -51,6 +53,8 @@ pub fn publish(
         }
     }
 
+    let bytecode_version = get_bytecode_version_from_env();
+
     // use the the publish_module API from the VM if we do not allow breaking changes
     if !ignore_breaking_changes {
         let vm = MoveVM::new(natives).unwrap();
@@ -60,8 +64,8 @@ pub fn publish(
         let mut has_error = false;
         match override_ordering {
             None => {
-                for unit in package.modules()? {
-                    let module_bytes = unit.unit.serialize();
+                for unit in package.root_modules() {
+                    let module_bytes = unit.unit.serialize(bytecode_version);
                     let id = module(&unit.unit)?.self_id();
                     let sender = *id.address();
 
@@ -75,7 +79,7 @@ pub fn publish(
             }
             Some(ordering) => {
                 let module_map: BTreeMap<_, _> = package
-                    .modules()?
+                    .root_modules()
                     .into_iter()
                     .map(|unit| (unit.unit.name().to_string(), unit))
                     .collect();
@@ -86,7 +90,7 @@ pub fn publish(
                     match module_map.get(name) {
                         None => bail!("Invalid module name in publish ordering: {}", name),
                         Some(unit) => {
-                            let module_bytes = unit.unit.serialize();
+                            let module_bytes = unit.unit.serialize(bytecode_version);
                             module_bytes_vec.push(module_bytes);
                             if sender_opt.is_none() {
                                 sender_opt = Some(*module(&unit.unit)?.self_id().address());
@@ -130,9 +134,9 @@ pub fn publish(
         // backward incompatible changes, as as result, if this flag is set, we skip the VM process
         // and force the CLI to override the on-disk state directly
         let mut serialized_modules = vec![];
-        for unit in package.modules()? {
+        for unit in package.all_modules() {
             let id = module(&unit.unit)?.self_id();
-            let module_bytes = unit.unit.serialize();
+            let module_bytes = unit.unit.serialize(bytecode_version);
             serialized_modules.push((id, module_bytes));
         }
         state.save_modules(&serialized_modules)?;

@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -8,19 +9,17 @@ use crate::{
 use anyhow::Result;
 use move_compiler::{compiled_unit::AnnotatedCompiledUnit, diagnostics::FilesSourceText, Compiler};
 use petgraph::algo::toposort;
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    io::Write,
-    path::Path,
-};
+use std::{collections::BTreeSet, io::Write, path::Path};
 
-use super::{compiled_package::CompilationCachingStatus, package_layout::CompiledPackageLayout};
+use super::package_layout::CompiledPackageLayout;
 
 #[cfg(feature = "evm-backend")]
 use {
     colored::Colorize,
     move_to_yul::{options::Options as MoveToYulOptions, run_to_yul},
+    std::{fs, io},
     termcolor::Buffer,
+    walkdir::WalkDir,
 };
 
 #[derive(Debug, Clone)]
@@ -28,6 +27,56 @@ pub struct BuildPlan {
     root: PackageName,
     sorted_deps: Vec<PackageName>,
     resolution_graph: ResolvedGraph,
+}
+
+#[cfg(feature = "evm-backend")]
+fn should_recompile(
+    source_paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    output_paths: impl IntoIterator<Item = impl AsRef<Path>>,
+) -> Result<bool> {
+    let mut earliest_output_mod_time = None;
+    for output_path in output_paths.into_iter() {
+        match fs::metadata(output_path) {
+            Ok(meta) => {
+                let mod_time = meta
+                    .modified()
+                    .expect("failed to get file modification time");
+
+                match &mut earliest_output_mod_time {
+                    None => earliest_output_mod_time = Some(mod_time),
+                    Some(earliest_mod_time) => *earliest_mod_time = mod_time,
+                }
+            }
+            Err(err) => {
+                if let io::ErrorKind::NotFound = err.kind() {
+                    return Ok(true);
+                }
+                return Err(err.into());
+            }
+        }
+    }
+
+    let earliest_output_mod_time = match earliest_output_mod_time {
+        Some(mod_time) => mod_time,
+        None => panic!("no output files given -- this should not happen"),
+    };
+
+    for source_path in source_paths.into_iter() {
+        for entry in WalkDir::new(source_path) {
+            let entry = entry?;
+
+            let mod_time = entry
+                .metadata()?
+                .modified()
+                .expect("failed to get file modification time");
+
+            if mod_time > earliest_output_mod_time {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 impl BuildPlan {
@@ -49,11 +98,8 @@ impl BuildPlan {
         })
     }
 
-    pub fn compile<W: Write>(
-        &self,
-        writer: &mut W,
-    ) -> Result<(CompiledPackage, CompilationCachingStatus)> {
-        self.compile_with_driver(writer, |compiler, _| compiler.build_and_report())
+    pub fn compile<W: Write>(&self, writer: &mut W) -> Result<CompiledPackage> {
+        self.compile_with_driver(writer, |compiler| compiler.build_and_report())
     }
 
     pub fn compile_with_driver<W: Write>(
@@ -61,43 +107,51 @@ impl BuildPlan {
         writer: &mut W,
         mut compiler_driver: impl FnMut(
             Compiler,
-            bool,
         )
             -> anyhow::Result<(FilesSourceText, Vec<AnnotatedCompiledUnit>)>,
-    ) -> Result<(CompiledPackage, CompilationCachingStatus)> {
+    ) -> Result<CompiledPackage> {
         let root_package = &self.resolution_graph.package_table[&self.root];
         let project_root = match &self.resolution_graph.build_options.install_dir {
             Some(under_path) => under_path.clone(),
             None => self.resolution_graph.root_package_path.clone(),
         };
-        let mut compiled: BTreeMap<PackageName, (CompiledPackage, CompilationCachingStatus)> =
-            BTreeMap::new();
-        for package_ident in &self.sorted_deps {
-            let resolved_package = self.resolution_graph.get_package(package_ident);
-            let dependencies: Vec<_> = resolved_package
-                .transitive_dependencies(&self.resolution_graph)
-                .into_iter()
-                .map(|package_name| compiled.get(&package_name).unwrap().clone())
-                .collect();
-            let compiled_package = CompiledPackage::build(
-                writer,
-                &project_root,
-                resolved_package.clone(),
-                dependencies,
-                &self.resolution_graph,
-                package_ident == &root_package.source_package.package.name,
-                &mut compiler_driver,
-            )?;
-            compiled.insert(*package_ident, compiled_package);
-        }
-        let compiled_names = compiled.keys().collect::<BTreeSet<_>>();
+        let immediate_dependencies_names =
+            root_package.immediate_dependencies(&self.resolution_graph);
+        let transitive_dependencies = root_package
+            .transitive_dependencies(&self.resolution_graph)
+            .into_iter()
+            .map(|package_name| {
+                let dep_package = self
+                    .resolution_graph
+                    .package_table
+                    .get(&package_name)
+                    .unwrap();
+                let dep_source_paths = dep_package
+                    .get_sources(&self.resolution_graph.build_options)
+                    .unwrap();
+                (
+                    package_name,
+                    immediate_dependencies_names.contains(&package_name),
+                    dep_source_paths,
+                    &dep_package.resolution_table,
+                )
+            })
+            .collect();
+
+        let compiled = CompiledPackage::build_all(
+            writer,
+            &project_root,
+            root_package.clone(),
+            transitive_dependencies,
+            &self.resolution_graph,
+            &mut compiler_driver,
+        )?;
+
         Self::clean(
             &project_root.join(CompiledPackageLayout::Root.path()),
-            compiled_names,
+            self.sorted_deps.iter().copied().collect(),
         )?;
-        Ok(compiled
-            .remove(&root_package.source_package.package.name)
-            .unwrap())
+        Ok(compiled)
     }
 
     #[cfg(feature = "evm-backend")]
@@ -113,14 +167,6 @@ impl BuildPlan {
 
         // Step 1: Compile Move into Yul
         //   Step 1a: Gather command line arguments for move-to-yul
-        let package_names = self
-            .resolution_graph
-            .package_table
-            .iter()
-            .map(|(name, _)| name.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-
         let dependencies = self
             .resolution_graph
             .package_table
@@ -135,18 +181,18 @@ impl BuildPlan {
                     ))
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
 
         let sources = vec![format!(
             "{}/sources",
             root_package.package_path.to_string_lossy()
         )];
 
-        let named_address_mapping = self
-            .resolution_graph
-            .extract_named_address_mapping()
-            .map(|(name, addr)| format!("{}={}", name.as_str(), addr))
-            .collect();
+        let bytecode_output = format!(
+            "{}/{}.bin",
+            build_root_path.to_string_lossy(),
+            root_package.source_package.package.name
+        );
 
         let yul_output = format!(
             "{}/{}.yul",
@@ -159,7 +205,43 @@ impl BuildPlan {
             root_package.source_package.package.name
         );
 
-        //   Step 1b: Call move-to-yul
+        let output_paths = [&bytecode_output, &yul_output, &abi_output];
+
+        let package_names = self
+            .resolution_graph
+            .package_table
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let named_address_mapping = self
+            .resolution_graph
+            .extract_named_address_mapping()
+            .map(|(name, addr)| format!("{}={}", name.as_str(), addr))
+            .collect();
+
+        //   Step 1b: Check if a fresh compilation is really needed. Only recompile if either
+        //              a) Some of the output artifacts are missing
+        //              b) Any source files have been modified since last compile
+        let manifests = self
+            .resolution_graph
+            .package_table
+            .iter()
+            .map(|(_name, package)| format!("{}/Move.toml", package.package_path.to_string_lossy()))
+            .collect::<Vec<_>>();
+
+        let all_sources = manifests
+            .iter()
+            .chain(sources.iter())
+            .chain(dependencies.iter());
+
+        if !should_recompile(all_sources, output_paths)? {
+            writeln!(writer, "{} {}", "CACHED".bold().green(), package_names)?;
+            return Ok(());
+        }
+
+        //   Step 1c: Call move-to-yul
         writeln!(
             writer,
             "{} {} to Yul",
@@ -167,6 +249,22 @@ impl BuildPlan {
             package_names
         )?;
 
+        if let Err(err) = std::fs::remove_dir_all(&build_root_path) {
+            match err.kind() {
+                io::ErrorKind::NotFound => (),
+                _ => {
+                    writeln!(
+                        writer,
+                        "{} Failed to remove build dir {}: {}",
+                        "ERROR".bold().red(),
+                        build_root_path.to_string_lossy(),
+                        err,
+                    )?;
+
+                    return Err(err.into());
+                }
+            }
+        }
         if let Err(err) = std::fs::create_dir_all(&build_root_path) {
             writeln!(
                 writer,
@@ -194,7 +292,8 @@ impl BuildPlan {
         ) {
             writeln!(
                 writer,
-                "{} Failed to compile Move into Yul",
+                "{} Failed to compile Move into Yul {}",
+                err,
                 "ERROR".bold().red()
             )?;
 
@@ -214,6 +313,7 @@ impl BuildPlan {
         }
 
         // Step 2: Compile Yul into bytecode using solc
+
         let yul_source = match std::fs::read_to_string(&yul_output) {
             Ok(yul_source) => yul_source,
             Err(err) => {
@@ -227,12 +327,6 @@ impl BuildPlan {
                 return Err(err.into());
             }
         };
-
-        let bytecode_output = format!(
-            "{}/{}.bin",
-            build_root_path.to_string_lossy(),
-            root_package.source_package.package.name
-        );
 
         writeln!(
             writer,
@@ -289,7 +383,7 @@ impl BuildPlan {
 
     // Clean out old packages that are no longer used, or no longer used under the current
     // compilation flags
-    fn clean(build_root: &Path, keep_paths: BTreeSet<&PackageName>) -> Result<()> {
+    fn clean(build_root: &Path, keep_paths: BTreeSet<PackageName>) -> Result<()> {
         for dir in std::fs::read_dir(build_root)? {
             let path = dir?.path();
             if !keep_paths.iter().any(|name| path.ends_with(name.as_str())) {

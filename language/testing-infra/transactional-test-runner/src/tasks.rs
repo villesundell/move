@@ -1,50 +1,21 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
 use anyhow::{anyhow, bail, Result};
 use clap::*;
-use move_command_line_common::files::{MOVE_EXTENSION, MOVE_IR_EXTENSION};
-use move_compiler::shared::NumericalAddress;
-use move_core_types::{
-    account_address::AccountAddress,
-    identifier::Identifier,
-    language_storage::{ModuleId, TypeTag},
-    parser,
-    transaction_argument::TransactionArgument,
+use move_command_line_common::{
+    address::ParsedAddress,
+    files::{MOVE_EXTENSION, MOVE_IR_EXTENSION},
+    types::{ParsedStructType, ParsedType},
+    values::{ParsableValue, ParsedValue},
 };
-use std::{fmt::Debug, path::Path, str::FromStr};
+use move_compiler::shared::NumericalAddress;
+use move_core_types::identifier::Identifier;
+use std::{convert::TryInto, fmt::Debug, path::Path, str::FromStr};
 use tempfile::NamedTempFile;
-
-#[derive(Debug)]
-pub enum RawAddress {
-    Named(Identifier),
-    Anonymous(AccountAddress),
-}
-
-fn parse_address_literal(s: &str) -> Result<AccountAddress> {
-    let (array, _) = move_compiler::shared::parse_address(s).ok_or_else(|| {
-        anyhow!(
-            "Failed to parse address {} to AccountAddress with Length {}",
-            s,
-            AccountAddress::LENGTH
-        )
-    })?;
-
-    Ok(AccountAddress::new(array))
-}
-
-impl RawAddress {
-    pub fn parse(s: &str) -> Result<Self> {
-        if let Ok(addr) = parse_address_literal(s) {
-            return Ok(Self::Anonymous(addr));
-        }
-        let name =
-            Identifier::new(s).map_err(|_| anyhow!("Failed to parse \"{}\" as address.", s))?;
-        Ok(Self::Named(name))
-    }
-}
 
 #[derive(Debug)]
 pub struct TaskInput<Command> {
@@ -63,10 +34,15 @@ pub fn taskify<Command: Debug + Parser>(filename: &Path) -> Result<Vec<TaskInput
         fs::File,
         io::{self, BufRead, Write},
     };
-    #[allow(non_snake_case)]
-    let WHITESPACE = Regex::new(r"^\s*$").unwrap();
-    #[allow(non_snake_case)]
-    let COMMAND_TEXT = Regex::new(r"^\s*//#\s*(.*)\s*$").unwrap();
+    // checks for lines that are entirely whitespace
+    let re_whitespace = Regex::new(r"^\s*$").unwrap();
+    // checks for lines that start with // comments
+    // here the next character is whitespace or an ASCII character other than #
+    let re_comment = Regex::new(r"^\s*//(\s|[\x20-\x22]|[[\x24-\x7E]])").unwrap();
+    // checks for lines that start with //# commands
+    // cutting leading/trailing whitespace
+    // capturing the command text
+    let re_command_text = Regex::new(r"^\s*//#\s*(.*)\s*$").unwrap();
 
     let file = File::open(filename).unwrap();
     let lines: Vec<String> = io::BufReader::new(file)
@@ -75,14 +51,15 @@ pub fn taskify<Command: Debug + Parser>(filename: &Path) -> Result<Vec<TaskInput
         .collect();
 
     let lines_iter = lines.into_iter().enumerate().map(|(idx, l)| (idx + 1, l));
-    let skipped_whitespace =
-        lines_iter.skip_while(|(_line_number, line)| WHITESPACE.is_match(line));
+    let skipped_whitespace = lines_iter.skip_while(|(_line_number, line)| {
+        re_whitespace.is_match(line) || re_comment.is_match(line)
+    });
     let mut bucketed_lines = vec![];
     let mut cur_commands = vec![];
     let mut cur_text = vec![];
     let mut in_command = true;
     for (line_number, line) in skipped_whitespace {
-        if let Some(captures) = COMMAND_TEXT.captures(&line) {
+        if let Some(captures) = re_command_text.captures(&line) {
             if !in_command {
                 bucketed_lines.push((cur_commands, cur_text));
                 cur_commands = vec![];
@@ -98,7 +75,7 @@ pub fn taskify<Command: Debug + Parser>(filename: &Path) -> Result<Vec<TaskInput
                 continue;
             }
             cur_commands.push((line_number, command_text))
-        } else if WHITESPACE.is_match(&line) {
+        } else if re_whitespace.is_match(&line) {
             in_command = false;
             continue;
         } else {
@@ -172,7 +149,7 @@ pub fn taskify<Command: Debug + Parser>(filename: &Path) -> Result<Vec<TaskInput
             .map(|_| String::new())
             .chain(text.into_iter().map(|(_ln, l)| l))
             .collect::<Vec<String>>();
-        let data = if file_text_vec.iter().all(|s| WHITESPACE.is_match(s)) {
+        let data = if file_text_vec.iter().all(|s| re_whitespace.is_match(s)) {
             None
         } else {
             let data = NamedTempFile::new()?;
@@ -259,67 +236,60 @@ pub struct PublishCommand {
     pub syntax: Option<SyntaxChoice>,
 }
 
-/// TODO: this is a hack to support named addresses in transaction argument positions.
-/// Should reimplement in a better way in the future.
-#[derive(Debug)]
-pub enum Argument {
-    NamedAddress(Identifier),
-    TransactionArgument(TransactionArgument),
-}
-
 #[derive(Debug, Parser)]
-pub struct RunCommand {
+pub struct RunCommand<ExtraValueArgs: ParsableValue> {
     #[clap(
         long = "signers",
-        parse(try_from_str = RawAddress::parse),
+        parse(try_from_str = ParsedAddress::parse),
         takes_value(true),
         multiple_values(true),
         multiple_occurrences(true)
     )]
-    pub signers: Vec<RawAddress>,
+    pub signers: Vec<ParsedAddress>,
     #[clap(
         long = "args",
-        parse(try_from_str = parse_argument),
+        parse(try_from_str = ParsedValue::parse),
         takes_value(true),
         multiple_values(true),
         multiple_occurrences(true)
     )]
-    pub args: Vec<Argument>,
+    pub args: Vec<ParsedValue<ExtraValueArgs>>,
     #[clap(
         long = "type-args",
-        parse(try_from_str = parser::parse_type_tag),
+        parse(try_from_str = ParsedType::parse),
         takes_value(true),
         multiple_values(true),
         multiple_occurrences(true)
     )]
-    pub type_args: Vec<TypeTag>,
+    pub type_args: Vec<ParsedType>,
     #[clap(long = "gas-budget")]
     pub gas_budget: Option<u64>,
     #[clap(long = "syntax")]
     pub syntax: Option<SyntaxChoice>,
     #[clap(name = "NAME", parse(try_from_str = parse_qualified_module_access))]
-    pub name: Option<(ModuleId, Identifier)>,
+    pub name: Option<(ParsedAddress, Identifier, Identifier)>,
 }
 
 #[derive(Debug, Parser)]
 pub struct ViewCommand {
-    #[clap(long = "address", parse(try_from_str = RawAddress::parse))]
-    pub address: RawAddress,
-    #[clap(long = "resource", parse(try_from_str = parse_qualified_module_access_with_type_args))]
-    pub resource: (ModuleId, Identifier, Vec<TypeTag>),
+    #[clap(long = "address", parse(try_from_str = ParsedAddress::parse))]
+    pub address: ParsedAddress,
+    #[clap(long = "resource", parse(try_from_str = ParsedStructType::parse))]
+    pub resource: ParsedStructType,
 }
 
 #[derive(Debug)]
 pub enum TaskCommand<
     ExtraInitArgs: Parser,
     ExtraPublishArgs: Parser,
+    ExtraValueArgs: ParsableValue,
     ExtraRunArgs: Parser,
     SubCommands: Parser,
 > {
     Init(InitCommand, ExtraInitArgs),
     PrintBytecode(PrintBytecodeCommand),
     Publish(PublishCommand, ExtraPublishArgs),
-    Run(RunCommand, ExtraRunArgs),
+    Run(RunCommand<ExtraValueArgs>, ExtraRunArgs),
     View(ViewCommand),
     Subcommand(SubCommands),
 }
@@ -327,9 +297,11 @@ pub enum TaskCommand<
 impl<
         ExtraInitArgs: Parser,
         ExtraPublishArgs: Parser,
+        ExtraValueArgs: ParsableValue,
         ExtraRunArgs: Parser,
         SubCommands: Parser,
-    > FromArgMatches for TaskCommand<ExtraInitArgs, ExtraPublishArgs, ExtraRunArgs, SubCommands>
+    > FromArgMatches
+    for TaskCommand<ExtraInitArgs, ExtraPublishArgs, ExtraValueArgs, ExtraRunArgs, SubCommands>
 {
     fn from_arg_matches(matches: &ArgMatches) -> Result<Self, Error> {
         Ok(match matches.subcommand() {
@@ -364,9 +336,11 @@ impl<
 impl<
         ExtraInitArgs: Parser,
         ExtraPublishArgs: Parser,
+        ExtraValueArgs: ParsableValue,
         ExtraRunArgs: Parser,
         SubCommands: Parser,
-    > CommandFactory for TaskCommand<ExtraInitArgs, ExtraPublishArgs, ExtraRunArgs, SubCommands>
+    > CommandFactory
+    for TaskCommand<ExtraInitArgs, ExtraPublishArgs, ExtraValueArgs, ExtraRunArgs, SubCommands>
 {
     fn into_app<'help>() -> Command<'help> {
         SubCommands::command()
@@ -374,7 +348,9 @@ impl<
             .subcommand(InitCommand::augment_args(ExtraInitArgs::command()).name("init"))
             .subcommand(PrintBytecodeCommand::command().name("print-bytecode"))
             .subcommand(PublishCommand::augment_args(ExtraPublishArgs::command()).name("publish"))
-            .subcommand(RunCommand::augment_args(ExtraRunArgs::command()).name("run"))
+            .subcommand(
+                RunCommand::<ExtraValueArgs>::augment_args(ExtraRunArgs::command()).name("run"),
+            )
             .subcommand(ViewCommand::command().name("view"))
     }
 
@@ -391,38 +367,30 @@ impl<
 impl<
         ExtraInitArgs: Parser,
         ExtraPublishArgs: Parser,
+        ExtraValueArgs: ParsableValue,
         ExtraRunArgs: Parser,
         SubCommands: Parser,
-    > Parser for TaskCommand<ExtraInitArgs, ExtraPublishArgs, ExtraRunArgs, SubCommands>
+    > Parser
+    for TaskCommand<ExtraInitArgs, ExtraPublishArgs, ExtraValueArgs, ExtraRunArgs, SubCommands>
 {
 }
 
 #[derive(Debug, Parser)]
 pub struct EmptyCommand {}
 
-fn parse_qualified_module_access(s: &str) -> Result<(ModuleId, Identifier)> {
-    match move_core_types::parser::parse_type_tag(s)? {
-        TypeTag::Struct(s) => {
-            let id = ModuleId::new(s.address, s.module);
-            if !s.type_params.is_empty() {
-                bail!("Invalid module access. Did not expect type arguments")
-            }
-            Ok((id, s.name))
-        }
-        _ => bail!("Invalid module access"),
-    }
-}
-
-fn parse_qualified_module_access_with_type_args(
-    s: &str,
-) -> Result<(ModuleId, Identifier, Vec<TypeTag>)> {
-    match move_core_types::parser::parse_type_tag(s)? {
-        TypeTag::Struct(s) => {
-            let id = ModuleId::new(s.address, s.module);
-            Ok((id, s.name, s.type_params))
-        }
-        _ => bail!("Invalid module access"),
-    }
+fn parse_qualified_module_access(s: &str) -> Result<(ParsedAddress, Identifier, Identifier)> {
+    let [addr_str, module_str, struct_str]: [&str; 3] =
+        s.split("::").collect::<Vec<_>>().try_into().map_err(|e| {
+            anyhow!(
+                "Invalid module access. \
+                 Expected 3 distinct parts, address, module, and struct. Got error {:?}",
+                e
+            )
+        })?;
+    let addr = ParsedAddress::parse(addr_str)?;
+    let module = Identifier::new(module_str)?;
+    let struct_ = Identifier::new(struct_str)?;
+    Ok((addr, module, struct_))
 }
 
 impl FromStr for SyntaxChoice {
@@ -453,11 +421,4 @@ impl FromStr for PrintBytecodeInputChoice {
             )),
         }
     }
-}
-
-fn parse_argument(s: &str) -> Result<Argument> {
-    Ok(match s.strip_prefix('@') {
-        Some(stripped) => Argument::NamedAddress(Identifier::new(stripped)?),
-        None => Argument::TransactionArgument(parser::parse_transaction_argument(s)?),
-    })
 }

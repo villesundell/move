@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -11,9 +12,6 @@ pub mod control_flow_graph;
 pub mod error;
 pub mod summaries;
 pub mod transitions;
-
-#[macro_use]
-extern crate mirai_annotations;
 
 use crate::config::{Args, EXECUTE_UNVERIFIED_MODULE, RUN_ON_VM};
 use bytecode_generator::BytecodeGenerator;
@@ -57,12 +55,10 @@ fn run_verifier(module: CompiledModule) -> Result<CompiledModule, String> {
 
 static STORAGE_WITH_MOVE_STDLIB: Lazy<InMemoryStorage> = Lazy::new(|| {
     let mut storage = InMemoryStorage::new();
-    let (_, compiled_units) = Compiler::new(
-        vec![(
-            move_stdlib::move_stdlib_files(),
-            move_stdlib::move_stdlib_named_addresses(),
-        )],
+    let (_, compiled_units) = Compiler::from_files(
+        move_stdlib::move_stdlib_files(),
         vec![],
+        move_stdlib::move_stdlib_named_addresses(),
     )
     .build_and_report()
     .unwrap();
@@ -399,7 +395,7 @@ pub(crate) fn substitute(token: &SignatureToken, tys: &[SignatureToken]) -> Sign
         TypeParameter(idx) => {
             // Assume that the caller has previously parsed and verified the structure of the
             // file and that this guarantees that type parameter indices are always in bounds.
-            assume!((*idx as usize) < tys.len());
+            debug_assert!((*idx as usize) < tys.len());
             tys[*idx as usize].clone()
         }
     }

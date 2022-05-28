@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::bail;
@@ -155,7 +156,7 @@ impl Harness {
             self.log(format!("publishing {}", id));
             session
                 .get_move_session()
-                .publish_module(cu.serialize(), test_account(), gas)?
+                .publish_module(cu.serialize(None), test_account(), gas)?
         }
         Ok(())
     }
@@ -324,17 +325,14 @@ impl Harness {
     ) -> anyhow::Result<BTreeMap<Identifier, CompiledUnit>> {
         let mut module_cache = BTreeMap::new();
         for (id, path) in module_files {
-            let targets = vec![(vec![path.to_owned()], address_map.clone())];
-            let deps = vec![(
-                module_files
-                    .values()
-                    .filter(|p| *p != path)
-                    .cloned()
-                    .collect_vec(),
-                address_map.clone(),
-            )];
-            let compiler =
-                Compiler::new(targets, deps).set_flags(Flags::empty().set_flavor("async"));
+            let targets = vec![path.to_owned()];
+            let deps = module_files
+                .values()
+                .filter(|p| *p != path)
+                .cloned()
+                .collect();
+            let compiler = Compiler::from_files(targets, deps, address_map.clone())
+                .set_flags(Flags::empty().set_flavor("async"));
             let (sources, inner) = compiler.build()?;
             match inner {
                 Err(diags) => bail!(
@@ -370,7 +368,7 @@ impl<'a> ModuleResolver for HarnessProxy<'a> {
             .harness
             .module_cache
             .get(id.name())
-            .map(|c| c.serialize()))
+            .map(|c| c.serialize(None)))
     }
 }
 

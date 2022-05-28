@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::Context;
@@ -6,7 +7,7 @@ use codespan_reporting::{diagnostic::Severity, term::termcolor::Buffer};
 use evm::backend::MemoryVicinity;
 use evm_exec_utils::{compile, exec::Executor, tracing};
 use move_command_line_common::testing::EXP_EXT;
-use move_compiler::shared::NumericalAddress;
+use move_compiler::shared::{NumericalAddress, PackagePaths};
 use move_model::{
     model::{FunId, GlobalEnv, QualifiedId},
     options::ModelBuilderOptions,
@@ -30,18 +31,26 @@ fn test_runner(path: &Path) -> datatest_stable::Result<()> {
         path_from_crate_root("../stdlib/sources"),
         path_from_crate_root("../../move-stdlib/sources"),
     ];
-    let mut named_address_mapping = move_stdlib_named_addresses();
-    named_address_mapping.insert(
+    let mut named_address_map = move_stdlib_named_addresses();
+    named_address_map.insert(
         "Std".to_string(),
         NumericalAddress::parse_str("0x1").unwrap(),
     );
-    named_address_mapping.insert(
+    named_address_map.insert(
         "Evm".to_string(),
         NumericalAddress::parse_str("0x2").unwrap(),
     );
     let env = run_model_builder_with_options_and_compilation_flags(
-        vec![(sources, named_address_mapping.clone())],
-        vec![(deps, named_address_mapping)],
+        vec![PackagePaths {
+            name: None,
+            paths: sources,
+            named_address_map: named_address_map.clone(),
+        }],
+        vec![PackagePaths {
+            name: None,
+            paths: deps,
+            named_address_map,
+        }],
         ModelBuilderOptions::default(),
         move_compiler::Flags::empty().set_sources_shadow_deps(true),
     )?;
@@ -56,8 +65,10 @@ fn test_runner(path: &Path) -> datatest_stable::Result<()> {
             options.experiments.push(exp.clone());
             format!("{}.{}", EXP_EXT, exp)
         };
-        let (_, mut out, _) = Generator::run(&options, &env);
+        let mut contracts = Generator::run(&options, &env);
+        let mut out = "".to_string();
         if !env.has_errors() {
+            out = out + &contracts.pop().expect("contract").1;
             out = format!("{}\n\n{}", out, compile_check(&options, &out));
 
             // Also generate any tests and run them.

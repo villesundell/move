@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use clap::Parser;
@@ -82,11 +83,7 @@ pub fn module_generation_settings() -> ModuleGeneratorOptions {
 
 /// Command line arguments for the tool
 #[derive(Debug, Parser)]
-#[clap(
-    name = "Bytecode Test Generator",
-    author = "Diem",
-    about = "Tool for generating tests for the bytecode verifier and Move VM runtime."
-)]
+#[clap(author, version, about)]
 pub struct Args {
     /// The optional number of programs that will be generated. If not specified, program
     /// generation will run infinitely.

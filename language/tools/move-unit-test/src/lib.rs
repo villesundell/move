@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod cargo_runner;
@@ -26,7 +27,7 @@ use std::{
 };
 
 #[derive(Debug, Parser, Clone)]
-#[clap(name = "Move Unit Test", about = "Unit testing for Move code.")]
+#[clap(author, version, about)]
 pub struct UnitTestingConfig {
     /// Bound the number of instructions that can be executed by any one test.
     #[clap(
@@ -160,19 +161,17 @@ impl UnitTestingConfig {
     ) -> Option<TestPlan> {
         let addresses =
             verify_and_create_named_address_mapping(self.named_address_values.clone()).ok()?;
-        let (files, comments_and_compiler_res) = Compiler::new(
-            vec![(source_files, addresses.clone())],
-            vec![(deps, addresses)],
-        )
-        .set_flags(Flags::testing())
-        .run::<PASS_CFGIR>()
-        .unwrap();
+        let (files, comments_and_compiler_res) =
+            Compiler::from_files(source_files, deps, addresses)
+                .set_flags(Flags::testing())
+                .run::<PASS_CFGIR>()
+                .unwrap();
         let (_, compiler) =
             diagnostics::unwrap_or_report_diagnostics(&files, comments_and_compiler_res);
 
         let (mut compiler, cfgir) = compiler.into_ast();
         let compilation_env = compiler.compilation_env();
-        let test_plan = unit_test::plan_builder::construct_test_plan(compilation_env, &cfgir);
+        let test_plan = unit_test::plan_builder::construct_test_plan(compilation_env, None, &cfgir);
 
         if let Err(diags) = compilation_env.check_diags_at_or_above_severity(Severity::Warning) {
             diagnostics::report_diagnostics(&files, diags);

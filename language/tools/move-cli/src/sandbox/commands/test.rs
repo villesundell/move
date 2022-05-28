@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{sandbox::utils::module, DEFAULT_BUILD_DIR, DEFAULT_STORAGE_DIR};
@@ -69,8 +70,7 @@ fn collect_coverage(
     )?
     .into_compiled_package()?;
     let src_modules = pkg
-        .modules()?
-        .into_iter()
+        .all_modules()
         .map(|unit| {
             let absolute_path = path_to_string(&unit.source_path.canonicalize()?)?;
             Ok((absolute_path, module(&unit.unit)?.clone()))
@@ -222,6 +222,29 @@ pub fn run_one(
     env::set_var(COLOR_MODE_ENV_VAR, "NONE");
     for args_line in args_file {
         let args_line = args_line?;
+
+        if let Some(external_cmd) = args_line.strip_prefix(">") {
+            let external_cmd = external_cmd.trim_start();
+            let mut cmd_iter = external_cmd.split_ascii_whitespace();
+
+            let external_program = cmd_iter.next().expect("empty external command");
+
+            let mut command = Command::new(external_program);
+            command.args(cmd_iter);
+            if let Some(work_dir) = temp_dir.as_ref() {
+                command.current_dir(&work_dir.1);
+            } else {
+                command.current_dir(exe_dir);
+            }
+            let cmd_output = command.output()?;
+
+            output += &format!("External Command `{}`:\n", external_cmd);
+            output += std::str::from_utf8(&cmd_output.stdout)?;
+            output += std::str::from_utf8(&cmd_output.stderr)?;
+
+            continue;
+        }
+
         if args_line.starts_with('#') {
             // allow comments in args.txt
             continue;

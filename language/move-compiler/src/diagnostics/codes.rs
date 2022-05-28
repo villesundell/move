@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //**************************************************************************************************
@@ -223,6 +224,8 @@ codes!(
         InvalidValue: { msg: "invalid attribute value", severity: NonblockingError },
         InvalidUsage: { msg: "invalid usage of known attribute", severity: NonblockingError },
         InvalidTest: { msg: "unable to generate test", severity: NonblockingError },
+        InvalidBytecodeInst:
+            { msg: "unknown bytecode instruction function", severity: NonblockingError },
     ],
     Tests: [
         TestFailed: { msg: "test failure", severity: BlockingError },

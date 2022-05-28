@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -73,10 +74,11 @@ impl NativeFunctions {
                         ctx.env.error(
                             &gen.parent.contract_loc,
                             &format!(
-                                "native function {} can only emit event structs",
+                                "native function {} can only emit event structs but `{}` is not an #[event]",
                                 ctx.env
                                     .get_function(fun_id.to_qualified_id())
-                                    .get_full_name_str()
+                                    .get_full_name_str(),
+                                ctx.env.display(&st_id)
                             ),
                         )
                     }

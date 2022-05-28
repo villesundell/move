@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod compiler;
@@ -23,6 +24,8 @@ pub const TEST: &str = "test";
 pub const TEST_SHORT: char = 't';
 
 pub const FLAVOR: &str = "flavor";
+
+pub const BYTECODE_VERSION: &str = "bytecode-version";
 
 pub const COLOR_MODE_ENV_VAR: &str = "COLOR_MODE";
 

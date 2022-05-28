@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use clap::Parser;
@@ -8,10 +9,7 @@ use move_core_types::{
     language_storage::ModuleId,
 };
 #[derive(Debug, Parser)]
-#[clap(
-    name = "Move Explain",
-    about = "Explain Move abort codes. Errors are defined as a global category + module-specific reason for the error."
-)]
+#[clap(author, version, about)]
 struct Args {
     /// The location (module id) returned with a `MoveAbort` error
     #[clap(long = "location", short = 'l')]

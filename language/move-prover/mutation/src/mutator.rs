@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 // Functions for running move programs with mutations and reporting errors if found
@@ -7,6 +8,7 @@ use clap::{Arg, Command};
 use codespan_reporting::term::termcolor::{ColorChoice, StandardStream};
 use itertools::Itertools;
 use log::LevelFilter;
+use move_compiler::shared::PackagePaths;
 use move_model::{
     model::{FunctionEnv, GlobalEnv, VerificationScope},
     options::ModelBuilderOptions,
@@ -123,8 +125,16 @@ fn apply_mutation(
     println!("building model");
     let addrs = parse_addresses_from_options(addresses.to_owned())?;
     let env = run_model_builder_with_options(
-        vec![(modules.to_vec(), addrs.clone())],
-        vec![(dep_dirs.to_vec(), addrs)],
+        vec![PackagePaths {
+            name: None,
+            paths: modules.to_vec(),
+            named_address_map: addrs.clone(),
+        }],
+        vec![PackagePaths {
+            name: None,
+            paths: dep_dirs.to_vec(),
+            named_address_map: addrs,
+        }],
         ModelBuilderOptions::default(),
     )?;
     let mut error_writer = StandardStream::stderr(ColorChoice::Auto);

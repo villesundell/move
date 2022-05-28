@@ -1,4 +1,5 @@
 // Copyright (c) The Diem Core Contributors
+// Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use move_command_line_common::testing::{format_diff, read_env_update_baseline, EXP_EXT};
@@ -63,11 +64,11 @@ pub fn run_test(path: &Path) -> datatest_stable::Result<()> {
                 .and_then(|bp| bp.compile(&mut Vec::new()))
             {
                 Ok(mut pkg) => {
-                    pkg.0.compiled_package_info.source_digest =
+                    pkg.compiled_package_info.source_digest =
                         Some(PackageDigest::from("ELIDED_FOR_TEST"));
-                    pkg.0.compiled_package_info.build_flags.install_dir =
+                    pkg.compiled_package_info.build_flags.install_dir =
                         Some(PathBuf::from("ELIDED_FOR_TEST"));
-                    format!("{:#?}\n", pkg.0.compiled_package_info)
+                    format!("{:#?}\n", pkg.compiled_package_info)
                 }
                 Err(error) => format!("{:#}\n", error),
             },
