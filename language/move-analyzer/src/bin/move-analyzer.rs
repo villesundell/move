@@ -28,7 +28,7 @@ use move_symbol_pool::Symbol;
 use url::Url;
 
 #[derive(Parser)]
-#[clap(author, version = "1.0.0", about)]
+#[clap(author, version, about)]
 struct Options {}
 
 fn main() {
@@ -106,6 +106,7 @@ fn main() {
             symbols::DEFS_AND_REFS_SUPPORT,
         )),
         references_provider: Some(OneOf::Left(symbols::DEFS_AND_REFS_SUPPORT)),
+        document_symbol_provider: Some(OneOf::Left(true)),
         ..Default::default()
     })
     .expect("could not serialize server capabilities");
@@ -222,7 +223,9 @@ fn main() {
 
 fn on_request(context: &Context, request: &Request) {
     match request.method.as_str() {
-        lsp_types::request::Completion::METHOD => on_completion_request(context, request),
+        lsp_types::request::Completion::METHOD => {
+            on_completion_request(context, request, &context.symbols.lock().unwrap())
+        }
         lsp_types::request::GotoDefinition::METHOD => {
             symbols::on_go_to_def_request(context, request, &context.symbols.lock().unwrap());
         }
@@ -234,6 +237,9 @@ fn on_request(context: &Context, request: &Request) {
         }
         lsp_types::request::HoverRequest::METHOD => {
             symbols::on_hover_request(context, request, &context.symbols.lock().unwrap());
+        }
+        lsp_types::request::DocumentSymbolRequest::METHOD => {
+            symbols::on_document_symbol_request(context, request, &context.symbols.lock().unwrap());
         }
         _ => eprintln!("handle request '{}' from client", request.method),
     }

@@ -4,6 +4,7 @@
 
 use crate::natives::helpers::make_module_natives;
 use move_binary_format::errors::PartialVMResult;
+use move_core_types::gas_algebra::InternalGas;
 use move_vm_runtime::native_functions::{NativeContext, NativeFunction};
 use move_vm_types::{
     loaded_data::runtime_types::Type,
@@ -22,7 +23,7 @@ use std::{collections::VecDeque, sync::Arc};
  **************************************************************************************************/
 #[derive(Debug, Clone)]
 pub struct BorrowAddressGasParameters {
-    pub base_cost: u64,
+    pub base: InternalGas,
 }
 
 #[inline]
@@ -38,7 +39,7 @@ fn native_borrow_address(
     let signer_reference = pop_arg!(arguments, SignerRef);
 
     Ok(NativeResult::ok(
-        gas_params.base_cost,
+        gas_params.base,
         smallvec![signer_reference.borrow_signer()?],
     ))
 }

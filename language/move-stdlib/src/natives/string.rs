@@ -6,6 +6,7 @@
 
 use crate::natives::helpers::make_module_natives;
 use move_binary_format::errors::PartialVMResult;
+use move_core_types::gas_algebra::{InternalGas, InternalGasPerByte, NumBytes};
 use move_vm_runtime::native_functions::{NativeContext, NativeFunction};
 use move_vm_types::{
     loaded_data::runtime_types::Type,
@@ -31,8 +32,8 @@ use std::{collections::VecDeque, sync::Arc};
  **************************************************************************************************/
 #[derive(Debug, Clone)]
 pub struct CheckUtf8GasParameters {
-    pub base_cost: u64,
-    pub unit_cost: u64,
+    pub base: InternalGas,
+    pub per_byte: InternalGasPerByte,
 }
 
 fn native_check_utf8(
@@ -47,7 +48,7 @@ fn native_check_utf8(
     let ok = std::str::from_utf8(s_ref.as_slice()).is_ok();
     // TODO: extensible native cost tables
 
-    let cost = gas_params.base_cost + gas_params.unit_cost * s_ref.as_slice().len() as u64;
+    let cost = gas_params.base + gas_params.per_byte * NumBytes::new(s_ref.as_slice().len() as u64);
 
     NativeResult::map_partial_vm_result_one(cost, Ok(Value::bool(ok)))
 }
@@ -68,7 +69,7 @@ pub fn make_native_check_utf8(gas_params: CheckUtf8GasParameters) -> NativeFunct
  **************************************************************************************************/
 #[derive(Debug, Clone)]
 pub struct IsCharBoundaryGasParameters {
-    pub base_cost: u64,
+    pub base: InternalGas,
 }
 
 fn native_is_char_boundary(
@@ -85,7 +86,7 @@ fn native_is_char_boundary(
         // This is safe because we guarantee the bytes to be utf8.
         std::str::from_utf8_unchecked(s_ref.as_slice()).is_char_boundary(i as usize)
     };
-    NativeResult::map_partial_vm_result_one(gas_params.base_cost, Ok(Value::bool(ok)))
+    NativeResult::map_partial_vm_result_one(gas_params.base, Ok(Value::bool(ok)))
 }
 
 pub fn make_native_is_char_boundary(gas_params: IsCharBoundaryGasParameters) -> NativeFunction {
@@ -104,8 +105,8 @@ pub fn make_native_is_char_boundary(gas_params: IsCharBoundaryGasParameters) -> 
  **************************************************************************************************/
 #[derive(Debug, Clone)]
 pub struct SubStringGasParameters {
-    pub base_cost: u64,
-    pub unit_cost: u64,
+    pub base: InternalGas,
+    pub per_byte: InternalGasPerByte,
 }
 
 fn native_sub_string(
@@ -120,7 +121,7 @@ fn native_sub_string(
 
     if j < i {
         // TODO: what abort code should we use here?
-        return Ok(NativeResult::err(gas_params.base_cost, 1));
+        return Ok(NativeResult::err(gas_params.base, 1));
     }
 
     let s_arg = pop_arg!(args, VectorRef);
@@ -131,7 +132,7 @@ fn native_sub_string(
     };
     let v = Value::vector_u8((&s_str[i..j]).as_bytes().iter().cloned());
 
-    let cost = gas_params.base_cost + gas_params.unit_cost * (j - i) as u64;
+    let cost = gas_params.base + gas_params.per_byte * NumBytes::new((j - i) as u64);
     NativeResult::map_partial_vm_result_one(cost, Ok(v))
 }
 
@@ -151,8 +152,9 @@ pub fn make_native_sub_string(gas_params: SubStringGasParameters) -> NativeFunct
  **************************************************************************************************/
 #[derive(Debug, Clone)]
 pub struct IndexOfGasParameters {
-    pub base_cost: u64,
-    pub unit_cost: u64,
+    pub base: InternalGas,
+    pub per_byte_pattern: InternalGasPerByte,
+    pub per_byte_searched: InternalGasPerByte,
 }
 
 fn native_index_of(
@@ -172,13 +174,11 @@ fn native_index_of(
         Some(size) => size,
         None => s_str.len(),
     };
-    let cost = gas_params.base_cost
-        + gas_params.unit_cost
-            * if pos < s_str.len() {
-                pos + r_str.len()
-            } else {
-                pos
-            } as u64;
+    // TODO(Gas): What is the algorithm used for the search?
+    //            Ideally it should be something like KMP with O(n) time complexity...
+    let cost = gas_params.base
+        + gas_params.per_byte_pattern * NumBytes::new(r_str.len() as u64)
+        + gas_params.per_byte_searched * NumBytes::new(pos as u64);
     NativeResult::map_partial_vm_result_one(cost, Ok(Value::u64(pos as u64)))
 }
 

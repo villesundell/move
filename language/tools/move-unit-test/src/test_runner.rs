@@ -17,8 +17,7 @@ use move_compiler::{
 };
 use move_core_types::{
     account_address::AccountAddress,
-    effects::ChangeSet,
-    gas_schedule::{GasAlgebra, GasUnits},
+    effects::{ChangeSet, Op},
     identifier::IdentStr,
     value::serialize_values,
     vm_status::StatusCode,
@@ -35,7 +34,7 @@ use move_stackless_bytecode_interpreter::{
 };
 use move_vm_runtime::{move_vm::MoveVM, native_functions::NativeFunctionTable};
 use move_vm_test_utils::{
-    gas_schedule::{zero_cost_schedule, CostTable, GasCost, GasStatus},
+    gas_schedule::{zero_cost_schedule, CostTable, Gas, GasCost, GasStatus},
     InMemoryStorage,
 };
 use rayon::prelude::*;
@@ -117,8 +116,8 @@ fn print_resources_and_extensions(
     for (account_addr, account_state) in cs.accounts() {
         writeln!(&mut buf, "0x{}:", account_addr.short_str_lossless())?;
 
-        for (tag, resource_opt) in account_state.resources() {
-            if let Some(resource) = resource_opt {
+        for (tag, resource_op) in account_state.resources() {
+            if let Op::New(resource) | Op::Modify(resource) = resource_op {
                 writeln!(
                     &mut buf,
                     "\t{}",
@@ -210,7 +209,11 @@ impl TestRunner {
                 let tests = std::mem::take(&mut module_test.tests);
                 module_test.tests = tests
                     .into_iter()
-                    .filter(|(test_name, _)| test_name.as_str().contains(test_name_slice))
+                    .filter(|(test_name, _)| {
+                        let full_name =
+                            format!("{}::{}", module_id.name().as_str(), test_name.as_str());
+                        full_name.contains(test_name_slice)
+                    })
                     .collect();
             }
         }
@@ -274,7 +277,7 @@ impl SharedTestingConfig {
         let extensions = extensions::new_extensions();
         let mut session =
             move_vm.new_session_with_extensions(&self.starting_storage_state, extensions);
-        let mut gas_meter = GasStatus::new(&self.cost_table, GasUnits::new(self.execution_bound));
+        let mut gas_meter = GasStatus::new(&self.cost_table, Gas::new(self.execution_bound));
         // TODO: collect VM logs if the verbose flag (i.e, `self.verbose`) is set
 
         let now = Instant::now();
@@ -299,7 +302,12 @@ impl SharedTestingConfig {
         let test_run_info = TestRunInfo::new(
             function_name.to_string(),
             now.elapsed(),
-            self.execution_bound - gas_meter.remaining_gas().get(),
+            // TODO(Gas): This doesn't look quite right...
+            //            We're not computing the number of instructions executed even with a unit gas schedule.
+            Gas::new(self.execution_bound)
+                .checked_sub(gas_meter.remaining_gas())
+                .unwrap()
+                .into(),
         );
         match session.finish_with_extensions() {
             Ok((cs, _, extensions)) => (Ok(cs), Ok(extensions), return_result, test_run_info),
