@@ -3158,8 +3158,6 @@ dependencies = [
  "log",
  "move-compiler",
  "move-model",
- "move-prover",
- "move-prover-test-utils",
  "num 0.4.0",
  "once_cell",
  "regex",
