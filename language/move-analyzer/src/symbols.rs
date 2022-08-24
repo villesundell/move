@@ -54,12 +54,15 @@ use crate::{
 use anyhow::{anyhow, Result};
 use codespan_reporting::files::SimpleFiles;
 use crossbeam::channel::Sender;
+use derivative::*;
 use im::ordmap::OrdMap;
 use lsp_server::{Request, RequestId};
 use lsp_types::{
-    request::GotoTypeDefinitionParams, Diagnostic, GotoDefinitionParams, Hover, HoverContents,
-    HoverParams, LanguageString, Location, MarkedString, Position, Range, ReferenceParams,
+    request::GotoTypeDefinitionParams, Diagnostic, DocumentSymbol, DocumentSymbolParams,
+    GotoDefinitionParams, Hover, HoverContents, HoverParams, LanguageString, Location,
+    MarkedString, Position, Range, ReferenceParams, SymbolKind,
 };
+
 use std::{
     cmp,
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -124,7 +127,8 @@ pub enum IdentType {
         ModuleIdent_, /* defining module */
         Symbol,       /* name */
         Vec<Type>,    /* type args */
-        Vec<Type>,    /* args */
+        Vec<Symbol>,  /* arg names */
+        Vec<Type>,    /* arg types */
         Type,         /* ret */
         Vec<Type>,    /* acquires */
     ),
@@ -145,33 +149,50 @@ pub struct UseDef {
     def_loc: DefLoc,
     /// Location of the type definition
     type_def_loc: Option<DefLoc>,
+    /// Doc string for the relevant identifier/function
+    doc_string: String,
 }
 
 /// Definition of a struct field
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Ord, PartialOrd, PartialEq, Eq)]
 struct FieldDef {
     name: Symbol,
     start: Position,
 }
 
 /// Definition of a struct
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Ord, PartialOrd, PartialEq, Eq)]
 struct StructDef {
     name_start: Position,
     field_defs: Vec<FieldDef>,
 }
 
+#[derive(Derivative, Debug, Clone, PartialEq, Eq)]
+#[derivative(PartialOrd, Ord)]
+pub struct FunctionDef {
+    name: Symbol,
+    start: Position,
+    attrs: Vec<String>,
+    #[derivative(PartialOrd = "ignore")]
+    #[derivative(Ord = "ignore")]
+    ident_type: IdentType,
+}
+
 /// Module-level definitions
-#[derive(Debug)]
-struct ModuleDefs {
+#[derive(Debug, Clone, Ord, PartialOrd, PartialEq, Eq)]
+pub struct ModuleDefs {
     /// File where this module is located
     fhash: FileHash,
+    /// Location where this module is located
+    start: Position,
+    /// Module name
+    name: ModuleIdent_,
     /// Struct definitions
     structs: BTreeMap<Symbol, StructDef>,
     /// Const definitions
     constants: BTreeMap<Symbol, Position>,
     /// Function definitions
-    functions: BTreeMap<Symbol, Position>,
+    functions: BTreeMap<Symbol, FunctionDef>,
 }
 
 /// Data used during symbolication
@@ -182,6 +203,8 @@ pub struct Symbolicator {
     files: SimpleFiles<Symbol, String>,
     /// A mapping from file hashes to file IDs (used to obtain source file locations)
     file_id_mapping: HashMap<FileHash, usize>,
+    // A mapping from file IDs to a split vector of the lines in each file (used to build docstrings)
+    file_id_to_lines: HashMap<usize, Vec<String>>,
     /// Contains type params where relevant (e.g. when processing function definition)
     type_params: BTreeMap<Symbol, DefLoc>,
     /// Current processed module (always set before module processing starts)
@@ -190,8 +213,12 @@ pub struct Symbolicator {
 
 /// Maps a line number to a list of use-def pairs on a given line (use-def set is sorted by
 /// col_start)
-#[derive(Debug)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 struct UseDefMap(BTreeMap<u32, BTreeSet<UseDef>>);
+
+/// Maps a function name to its usage definition
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct FunctionIdentTypeMap(BTreeMap<String, IdentType>);
 
 /// Result of the symbolication process
 pub struct Symbols {
@@ -201,6 +228,8 @@ pub struct Symbols {
     file_use_defs: BTreeMap<PathBuf, UseDefMap>,
     /// A mapping from file hashes to file names
     file_name_mapping: BTreeMap<FileHash, Symbol>,
+    /// A mapping from filePath to ModuleDefs
+    file_mods: BTreeMap<PathBuf, BTreeSet<ModuleDefs>>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -213,6 +242,12 @@ enum RunnerState {
 /// Data used during symbolication running and symbolication info updating
 pub struct SymbolicatorRunner {
     mtx_cvar: Arc<(Mutex<RunnerState>, Condvar)>,
+}
+
+impl ModuleDefs {
+    pub fn functions(&self) -> &BTreeMap<Symbol, FunctionDef> {
+        &self.functions
+    }
 }
 
 impl fmt::Display for IdentType {
@@ -228,7 +263,7 @@ impl fmt::Display for IdentType {
                 // IDE independently on how compiler error messages are generated.
                 write!(f, "{}", type_to_ide_string(t))
             }
-            Self::FunctionType(mod_ident, name, type_args, args, ret, acquires) => {
+            Self::FunctionType(mod_ident, name, type_args, arg_names, arg_types, ret, acquires) => {
                 let type_args_str = if !type_args.is_empty() {
                     let mut s = "<".to_string();
                     s.push_str(&type_list_to_ide_string(type_args));
@@ -256,13 +291,22 @@ impl fmt::Display for IdentType {
                     mod_ident.module.value(),
                     name,
                     type_args_str,
-                    type_list_to_ide_string(args),
+                    arg_list_to_ide_string(arg_names, arg_types),
                     ret_str,
                     acquires_str
                 )
             }
         }
     }
+}
+
+fn arg_list_to_ide_string(names: &[Symbol], types: &[Type]) -> String {
+    names
+        .iter()
+        .zip(types.iter())
+        .map(|(n, t)| format!("{}: {}", n, type_to_ide_string(t)))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn type_to_ide_string(sp!(_, t): &Type) -> String {
@@ -312,8 +356,8 @@ fn addr_to_ide_string(addr: &Address) -> String {
     }
 }
 
-fn type_list_to_ide_string(items: &[Type]) -> String {
-    items
+fn type_list_to_ide_string(types: &[Type]) -> String {
+    types
         .iter()
         .map(type_to_ide_string)
         .collect::<Vec<_>>()
@@ -464,6 +508,7 @@ impl UseDef {
         use_name: &Symbol,
         use_type: IdentType,
         type_def_loc: Option<DefLoc>,
+        doc_string: String,
     ) -> Self {
         let def_loc = DefLoc {
             fhash: def_fhash,
@@ -486,6 +531,7 @@ impl UseDef {
             use_type,
             def_loc,
             type_def_loc,
+            doc_string,
         }
     }
 }
@@ -530,6 +576,20 @@ impl UseDefMap {
     }
 }
 
+impl FunctionIdentTypeMap {
+    fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    fn insert(&mut self, key: String, val: IdentType) {
+        self.0.entry(key).or_insert_with(|| val);
+    }
+
+    pub fn contains_key(self, key: &String) -> bool {
+        self.0.contains_key(key)
+    }
+}
+
 impl Symbols {
     pub fn merge(&mut self, other: Self) {
         for (k, v) in other.references {
@@ -540,6 +600,11 @@ impl Symbols {
         }
         self.file_use_defs.extend(other.file_use_defs);
         self.file_name_mapping.extend(other.file_name_mapping);
+        self.file_mods.extend(other.file_mods);
+    }
+
+    pub fn file_mods(&self) -> &BTreeMap<PathBuf, BTreeSet<ModuleDefs>> {
+        &self.file_mods
     }
 }
 
@@ -566,11 +631,14 @@ impl Symbolicator {
         let source_files = &resolution_graph.file_sources();
         let mut files = SimpleFiles::new();
         let mut file_id_mapping = HashMap::new();
+        let mut file_id_to_lines = HashMap::new();
         let mut file_name_mapping = BTreeMap::new();
         for (fhash, (fname, source)) in source_files {
             let id = files.add(*fname, source.clone());
             file_id_mapping.insert(*fhash, id);
             file_name_mapping.insert(*fhash, *fname);
+            let lines: Vec<String> = source.lines().map(String::from).collect();
+            file_id_to_lines.insert(id, lines);
         }
 
         let build_plan = BuildPlan::create(resolution_graph)?;
@@ -635,38 +703,66 @@ impl Symbolicator {
 
         let mut mod_outer_defs = BTreeMap::new();
         let mut mod_use_defs = BTreeMap::new();
+        let mut file_mods = BTreeMap::new();
+
         for (pos, module_ident, module_def) in modules {
-            let (defs, symbols) =
-                Self::get_mod_outer_defs(&pos, module_def, &files, &file_id_mapping);
+            let (defs, symbols) = Self::get_mod_outer_defs(
+                &pos,
+                &sp(pos, *module_ident),
+                module_def,
+                &files,
+                &file_id_mapping,
+            );
+
+            let cloned_defs = defs.clone();
+            let path = file_name_mapping.get(&cloned_defs.fhash.clone()).unwrap();
+            file_mods
+                .entry(
+                    dunce::canonicalize(path.as_str())
+                        .unwrap_or_else(|_| PathBuf::from(path.as_str())),
+                )
+                .or_insert_with(BTreeSet::new)
+                .insert(cloned_defs);
+
             mod_outer_defs.insert(*module_ident, defs);
             mod_use_defs.insert(*module_ident, symbols);
         }
+
+        eprintln!("get_symbols loaded file_mods length: {}", file_mods.len());
 
         let mut symbolicator = Symbolicator {
             mod_outer_defs,
             files,
             file_id_mapping,
+            file_id_to_lines,
             type_params: BTreeMap::new(),
             current_mod: None,
         };
 
         let mut references = BTreeMap::new();
         let mut file_use_defs = BTreeMap::new();
+        let mut function_ident_type = FunctionIdentTypeMap::new();
+
         for (pos, module_ident, module_def) in modules {
             let mut use_defs = mod_use_defs.remove(module_ident).unwrap();
             symbolicator.current_mod = Some(sp(pos, *module_ident));
-            symbolicator.mod_symbols(module_def, &mut references, &mut use_defs);
+            symbolicator.mod_symbols(
+                module_def,
+                &mut references,
+                &mut use_defs,
+                &mut function_ident_type,
+            );
 
             let fpath = match source_files.get(&pos.file_hash()) {
                 Some((p, _)) => p,
                 None => continue,
             };
 
+            let fpath_buffer = dunce::canonicalize(fpath.as_str())
+                .unwrap_or_else(|_| PathBuf::from(fpath.as_str()));
+
             file_use_defs
-                .entry(
-                    dunce::canonicalize(fpath.as_str())
-                        .unwrap_or_else(|_| PathBuf::from(fpath.as_str())),
-                )
+                .entry(fpath_buffer)
                 .or_insert_with(UseDefMap::new)
                 .extend(use_defs.elements());
         }
@@ -675,7 +771,11 @@ impl Symbolicator {
             references,
             file_use_defs,
             file_name_mapping,
+            file_mods,
         };
+
+        eprintln!("get_symbols load complete");
+
         Ok((Some(symbols), ide_diagnostics))
     }
 
@@ -685,6 +785,7 @@ impl Symbolicator {
             file_use_defs: BTreeMap::new(),
             references: BTreeMap::new(),
             file_name_mapping: BTreeMap::new(),
+            file_mods: BTreeMap::new(),
         }
     }
 
@@ -693,6 +794,7 @@ impl Symbolicator {
     /// Get symbols for outer definitions in the module (functions, structs, and consts)
     fn get_mod_outer_defs(
         loc: &Loc,
+        mod_ident: &ModuleIdent,
         mod_def: &ModuleDefinition,
         files: &SimpleFiles<Symbol, String>,
         file_id_mapping: &HashMap<FileHash, usize>,
@@ -728,6 +830,7 @@ impl Symbolicator {
                     continue;
                 }
             };
+
             structs.insert(
                 *name,
                 StructDef {
@@ -748,7 +851,7 @@ impl Symbolicator {
             constants.insert(*name, name_start);
         }
 
-        for (pos, name, _) in &mod_def.functions {
+        for (pos, name, fun) in &mod_def.functions {
             let name_start = match Self::get_start_loc(&pos, files, file_id_mapping) {
                 Some(s) => s,
                 None => {
@@ -756,33 +859,8 @@ impl Symbolicator {
                     continue;
                 }
             };
-            functions.insert(*name, name_start);
-        }
-
-        let fhash = loc.file_hash();
-        let module_defs = ModuleDefs {
-            fhash,
-            structs,
-            constants,
-            functions,
-        };
-
-        let use_def_map = UseDefMap::new();
-        (module_defs, use_def_map)
-    }
-
-    /// Get symbols for the whole module
-    fn mod_symbols(
-        &mut self,
-        mod_def: &ModuleDefinition,
-        references: &mut BTreeMap<DefLoc, BTreeSet<UseLoc>>,
-        use_defs: &mut UseDefMap,
-    ) {
-        for (pos, name, fun) in &mod_def.functions {
-            // enter self-definition for function name (unwrap safe - done when inserting def)
-            let name_start = Self::get_start_loc(&pos, &self.files, &self.file_id_mapping).unwrap();
-            let use_type = IdentType::FunctionType(
-                self.current_mod.unwrap().value,
+            let ident_type = IdentType::FunctionType(
+                mod_ident.value,
                 *name,
                 fun.signature
                     .type_parameters
@@ -792,36 +870,113 @@ impl Symbolicator {
                 fun.signature
                     .parameters
                     .iter()
+                    .map(|(n, _)| n.value())
+                    .collect(),
+                fun.signature
+                    .parameters
+                    .iter()
                     .map(|(_, t)| t.clone())
                     .collect(),
                 fun.signature.return_type.clone(),
                 fun.acquires
                     .iter()
-                    .map(|(k, v)| {
-                        Self::create_struct_type(self.current_mod.unwrap(), *k, *v, vec![])
-                    })
+                    .map(|(k, v)| Self::create_struct_type(*mod_ident, *k, *v, vec![]))
                     .collect(),
             );
-            let ident_type_def = self.ident_type_def_loc(&use_type);
-            use_defs.insert(
-                name_start.line,
-                UseDef::new(
-                    references,
-                    pos.file_hash(),
-                    name_start,
-                    pos.file_hash(),
-                    name_start,
-                    name,
-                    use_type,
-                    ident_type_def,
-                ),
+            functions.insert(
+                *name,
+                FunctionDef {
+                    name: *name,
+                    start: name_start,
+                    attrs: fun
+                        .attributes
+                        .clone()
+                        .iter()
+                        .map(|(_loc, name, _attr)| name.to_string())
+                        .collect(),
+                    ident_type,
+                },
             );
+        }
+
+        let use_def_map = UseDefMap::new();
+
+        let name = mod_ident.value;
+        let fhash = loc.file_hash();
+        let start = match Self::get_start_loc(loc, files, file_id_mapping) {
+            Some(s) => s,
+            None => {
+                debug_assert!(false);
+                return (
+                    ModuleDefs {
+                        fhash,
+                        start: Position {
+                            line: 0,
+                            character: 0,
+                        },
+                        name,
+                        structs,
+                        constants,
+                        functions,
+                    },
+                    use_def_map,
+                );
+            }
+        };
+
+        let module_defs = ModuleDefs {
+            name,
+            start,
+            fhash,
+            structs,
+            constants,
+            functions,
+        };
+
+        (module_defs, use_def_map)
+    }
+
+    /// Get symbols for the whole module
+    fn mod_symbols(
+        &mut self,
+        mod_def: &ModuleDefinition,
+        references: &mut BTreeMap<DefLoc, BTreeSet<UseLoc>>,
+        use_defs: &mut UseDefMap,
+        function_ident_type: &mut FunctionIdentTypeMap,
+    ) {
+        for (pos, name, fun) in &mod_def.functions {
+            // enter self-definition for function name (unwrap safe - done when inserting def)
+            let name_start = Self::get_start_loc(&pos, &self.files, &self.file_id_mapping).unwrap();
+            let doc_string = self.extract_doc_string(&name_start, &pos.file_hash());
+
+            let mod_ident = self.current_mod.unwrap();
+
+            let mod_def = self.mod_outer_defs.get(&mod_ident.value).unwrap();
+            let fun_def = mod_def.functions.get(name).unwrap();
+            let use_type = fun_def.ident_type.clone();
+
+            let fun_type_def = self.ident_type_def_loc(&use_type);
+            let use_def = UseDef::new(
+                references,
+                pos.file_hash(),
+                name_start,
+                pos.file_hash(),
+                name_start,
+                name,
+                use_type.clone(),
+                fun_type_def,
+                doc_string,
+            );
+
+            use_defs.insert(name_start.line, use_def);
             self.fun_symbols(fun, references, use_defs);
+            function_ident_type.insert(name.to_string(), use_type);
         }
 
         for (pos, name, c) in &mod_def.constants {
             // enter self-definition for const name (unwrap safe - done when inserting def)
             let name_start = Self::get_start_loc(&pos, &self.files, &self.file_id_mapping).unwrap();
+            let doc_string = self.extract_doc_string(&name_start, &pos.file_hash());
             let ident_type = IdentType::RegularType(c.signature.clone());
             let ident_type_def = self.ident_type_def_loc(&ident_type);
             use_defs.insert(
@@ -835,6 +990,7 @@ impl Symbolicator {
                     name,
                     ident_type,
                     ident_type_def,
+                    doc_string,
                 ),
             );
         }
@@ -842,6 +998,7 @@ impl Symbolicator {
         for (pos, name, struct_def) in &mod_def.structs {
             // enter self-definition for struct name (unwrap safe - done when inserting def)
             let name_start = Self::get_start_loc(&pos, &self.files, &self.file_id_mapping).unwrap();
+            let doc_string = self.extract_doc_string(&name_start, &pos.file_hash());
             let ident_type = IdentType::RegularType(Self::create_struct_type(
                 self.current_mod.unwrap(),
                 StructName(sp(pos, *name)),
@@ -860,6 +1017,7 @@ impl Symbolicator {
                     name,
                     ident_type,
                     ident_type_def,
+                    doc_string,
                 ),
             );
 
@@ -887,6 +1045,7 @@ impl Symbolicator {
                 let start = Self::get_start_loc(&fpos, &self.files, &self.file_id_mapping).unwrap();
                 let ident_type = IdentType::RegularType(t.clone());
                 let ident_type_def = self.ident_type_def_loc(&ident_type);
+                let doc_string = self.extract_doc_string(&start, &fpos.file_hash());
                 use_defs.insert(
                     start.line,
                     UseDef::new(
@@ -898,6 +1057,7 @@ impl Symbolicator {
                         fname,
                         ident_type,
                         ident_type_def,
+                        doc_string,
                     ),
                 );
             }
@@ -970,6 +1130,74 @@ impl Symbolicator {
         file_id_mapping: &HashMap<FileHash, usize>,
     ) -> Option<Position> {
         get_loc(&pos.file_hash(), pos.start(), files, file_id_mapping)
+    }
+
+    /// Extracts the docstring (/// or /** ... */) for a given definition by traversing up from the line definition
+    fn extract_doc_string(&self, name_start: &Position, file_hash: &FileHash) -> String {
+        let mut doc_string = String::new();
+        let file_id = match self.file_id_mapping.get(file_hash) {
+            None => return doc_string,
+            Some(v) => v,
+        };
+
+        let file_lines = match self.file_id_to_lines.get(file_id) {
+            None => return doc_string,
+            Some(v) => v,
+        };
+
+        if name_start.line == 0 {
+            return doc_string;
+        }
+
+        let mut iter = (name_start.line - 1) as usize;
+        let mut line_before = file_lines[iter].trim();
+
+        // Detect the two different types of docstrings
+        if line_before.starts_with("///") {
+            while let Some(stripped_line) = line_before.strip_prefix("///") {
+                doc_string = format!("{}\n{}", stripped_line.trim(), doc_string);
+                if iter == 0 {
+                    break;
+                }
+                iter -= 1;
+                line_before = file_lines[iter].trim();
+            }
+        } else if line_before.ends_with("*/") {
+            let mut doc_string_found = false;
+            line_before = file_lines[iter].strip_suffix("*/").unwrap_or("").trim();
+
+            // Loop condition is a safe guard.
+            while !doc_string_found {
+                // We found the start of the multi-line comment/docstring
+                if line_before.starts_with("/*") {
+                    let is_doc = line_before.starts_with("/**") && !line_before.starts_with("/***");
+
+                    // Invalid doc_string start prefix so return empty doc string.
+                    if !is_doc {
+                        return String::new();
+                    }
+
+                    line_before = line_before.strip_prefix("/**").unwrap_or("").trim();
+                    doc_string_found = true;
+                }
+
+                doc_string = format!("{}\n{}", line_before, doc_string);
+
+                if iter == 0 {
+                    break;
+                }
+
+                iter -= 1;
+                line_before = file_lines[iter].trim();
+            }
+
+            // No doc_string found - return String::new();
+            if !doc_string_found {
+                return String::new();
+            }
+        }
+
+        doc_string
     }
 
     /// Get symbols for a sequence representing function body
@@ -1150,9 +1378,7 @@ impl Symbolicator {
                 use_defs,
                 exp.ty.clone(),
             ),
-            E::ModuleCall(mod_call) => {
-                self.mod_call_symbols(mod_call, scope, references, use_defs, exp.ty.clone())
-            }
+            E::ModuleCall(mod_call) => self.mod_call_symbols(mod_call, scope, references, use_defs),
             E::Builtin(builtin_fun, exp) => {
                 use BuiltinFunction_ as BF;
                 match &builtin_fun.value {
@@ -1302,21 +1528,16 @@ impl Symbolicator {
         scope: &mut OrdMap<Symbol, DefLoc>,
         references: &mut BTreeMap<DefLoc, BTreeSet<UseLoc>>,
         use_defs: &mut UseDefMap,
-        ret_type: Type,
     ) {
-        // handle function name
-        let use_type = IdentType::FunctionType(
-            mod_call.module.value,
-            mod_call.name.value(),
-            mod_call.type_arguments.clone(),
-            mod_call.parameter_types.clone(),
-            ret_type,
-            mod_call
-                .acquires
-                .iter()
-                .map(|(k, v)| Self::create_struct_type(mod_call.module, *k, *v, vec![]))
-                .collect(),
-        );
+        let mod_ident = mod_call.module;
+        let mod_def = self.mod_outer_defs.get(&mod_ident.value).unwrap();
+
+        let fun_def = match mod_def.functions.get(&mod_call.name.value()) {
+            Some(v) => v,
+            None => return,
+        };
+        let use_type = fun_def.ident_type.clone();
+
         self.add_fun_use_def(
             &mod_call.module,
             &mod_call.name.value(),
@@ -1400,6 +1621,8 @@ impl Symbolicator {
                     Type_::Param(tp.clone()),
                 ));
                 let ident_type_def = self.ident_type_def_loc(&ident_type);
+
+                let doc_string = self.extract_doc_string(&start, &fhash);
                 use_defs.insert(
                     start.line,
                     UseDef::new(
@@ -1411,6 +1634,7 @@ impl Symbolicator {
                         &tname,
                         ident_type,
                         ident_type_def,
+                        doc_string,
                     ),
                 );
                 let exists = tp_scope.insert(tname, DefLoc { fhash, start });
@@ -1470,18 +1694,22 @@ impl Symbolicator {
             |use_name, name_start, mod_defs| match mod_defs.constants.get(use_name) {
                 Some(def_start) => {
                     let ident_type = IdentType::RegularType(use_type.clone());
+                    let def_fhash = self.mod_outer_defs.get(&module_ident).unwrap().fhash;
+                    let doc_string = self.extract_doc_string(def_start, &def_fhash);
                     let ident_type_def = self.ident_type_def_loc(&ident_type);
+
                     use_defs.insert(
                         name_start.line,
                         UseDef::new(
                             references,
                             use_pos.file_hash(),
                             name_start,
-                            self.mod_outer_defs.get(&module_ident).unwrap().fhash,
+                            def_fhash,
                             *def_start,
                             use_name,
                             ident_type,
                             ident_type_def,
+                            doc_string,
                         ),
                     );
                 }
@@ -1505,18 +1733,21 @@ impl Symbolicator {
             use_name,
             use_pos,
             |use_name, name_start, mod_defs| match mod_defs.functions.get(use_name) {
-                Some(def_start) => {
+                Some(func_def) => {
+                    let def_fhash = self.mod_outer_defs.get(&module_ident.value).unwrap().fhash;
+                    let doc_string = self.extract_doc_string(&func_def.start, &def_fhash);
                     use_defs.insert(
                         name_start.line,
                         UseDef::new(
                             references,
                             use_pos.file_hash(),
                             name_start,
-                            self.mod_outer_defs.get(&module_ident.value).unwrap().fhash,
-                            *def_start,
+                            def_fhash,
+                            func_def.start,
                             use_name,
                             use_type.clone(),
                             self.ident_type_def_loc(&use_type),
+                            doc_string,
                         ),
                     );
                 }
@@ -1542,18 +1773,22 @@ impl Symbolicator {
             |use_name, name_start, mod_defs| match mod_defs.structs.get(use_name) {
                 Some(def) => {
                     let ident_type = IdentType::RegularType(use_type.clone());
+
                     let ident_type_def = self.ident_type_def_loc(&ident_type);
+                    let def_fhash = self.mod_outer_defs.get(module_ident).unwrap().fhash;
+                    let doc_string = self.extract_doc_string(&def.name_start, &def_fhash);
                     use_defs.insert(
                         name_start.line,
                         UseDef::new(
                             references,
                             use_pos.file_hash(),
                             name_start,
-                            self.mod_outer_defs.get(module_ident).unwrap().fhash,
+                            def_fhash,
                             def.name_start,
                             use_name,
                             ident_type,
                             ident_type_def,
+                            doc_string,
                         ),
                     );
                 }
@@ -1583,17 +1818,21 @@ impl Symbolicator {
                         if fdef.name == *use_name {
                             let ident_type = IdentType::RegularType(use_type.clone());
                             let ident_type_def = self.ident_type_def_loc(&ident_type);
+
+                            let def_fhash = self.mod_outer_defs.get(module_ident).unwrap().fhash;
+                            let doc_string = self.extract_doc_string(&fdef.start, &def_fhash);
                             use_defs.insert(
                                 name_start.line,
                                 UseDef::new(
                                     references,
                                     use_pos.file_hash(),
                                     name_start,
-                                    self.mod_outer_defs.get(module_ident).unwrap().fhash,
+                                    def_fhash,
                                     fdef.start,
                                     use_name,
                                     ident_type,
                                     ident_type_def,
+                                    doc_string,
                                 ),
                             );
                         }
@@ -1621,6 +1860,8 @@ impl Symbolicator {
                         Some(def_loc) => {
                             let ident_type = IdentType::RegularType(id_type.clone());
                             let ident_type_def = self.ident_type_def_loc(&ident_type);
+                            let doc_string =
+                                self.extract_doc_string(&def_loc.start, &def_loc.fhash);
                             use_defs.insert(
                                 name_start.line,
                                 UseDef::new(
@@ -1632,6 +1873,7 @@ impl Symbolicator {
                                     &use_name,
                                     ident_type,
                                     ident_type_def,
+                                    doc_string,
                                 ),
                             );
                         }
@@ -1680,6 +1922,8 @@ impl Symbolicator {
                 // in rust) a variable can be re-defined in the same scope replacing the previous
                 // definition
 
+                let doc_string = self.extract_doc_string(&name_start, &pos.file_hash());
+
                 // enter self-definition for def name
                 let ident_type = IdentType::RegularType(use_type);
                 let ident_type_def = self.ident_type_def_loc(&ident_type);
@@ -1694,6 +1938,7 @@ impl Symbolicator {
                         name,
                         ident_type,
                         ident_type_def,
+                        doc_string,
                     ),
                 );
             }
@@ -1723,6 +1968,7 @@ impl Symbolicator {
         };
 
         if let Some(def_loc) = scope.get(use_name) {
+            let doc_string = self.extract_doc_string(&def_loc.start, &def_loc.fhash);
             let ident_type = IdentType::RegularType(use_type);
             let ident_type_def = self.ident_type_def_loc(&ident_type);
             use_defs.insert(
@@ -1736,6 +1982,7 @@ impl Symbolicator {
                     use_name,
                     ident_type,
                     ident_type_def,
+                    doc_string,
                 ),
             );
         } else {
@@ -1759,7 +2006,7 @@ impl Symbolicator {
     fn ident_type_def_loc(&self, ident_type: &IdentType) -> Option<DefLoc> {
         match ident_type {
             IdentType::RegularType(t) => self.type_def_loc(t),
-            IdentType::FunctionType(_, _, _, _, ret, _) => self.type_def_loc(ret),
+            IdentType::FunctionType(_, _, _, _, _, ret, _) => self.type_def_loc(ret),
         }
     }
 
@@ -1946,7 +2193,11 @@ pub fn on_hover_request(context: &Context, request: &Request, symbols: &Symbols)
         |u| {
             let lang_string = LanguageString {
                 language: "".to_string(),
-                value: format!("{}", u.use_type),
+                value: if !u.doc_string.is_empty() {
+                    format!("{}\n\n{}", u.use_type, u.doc_string)
+                } else {
+                    format!("{}", u.use_type)
+                },
             };
             let contents = HoverContents::Scalar(MarkedString::LanguageString(lang_string));
             let range = None;
@@ -1995,8 +2246,147 @@ pub fn on_use_request(
     }
 }
 
+/// Handles document symbol request of the language server
+#[allow(deprecated)]
+pub fn on_document_symbol_request(context: &Context, request: &Request, symbols: &Symbols) {
+    let parameters = serde_json::from_value::<DocumentSymbolParams>(request.params.clone())
+        .expect("could not deserialize document symbol request");
+
+    let fpath = parameters.text_document.uri.to_file_path().unwrap();
+    eprintln!("on_document_symbol_request: {:?}", fpath);
+
+    let empty_mods: BTreeSet<ModuleDefs> = BTreeSet::new();
+    let mods = symbols.file_mods.get(&fpath).unwrap_or(&empty_mods);
+
+    let mut defs: Vec<DocumentSymbol> = vec![];
+    for mod_def in mods {
+        let name = mod_def.name.module.clone().to_string();
+        let detail = Some(mod_def.name.clone().to_string());
+        let kind = SymbolKind::Module;
+        let range = Range {
+            start: mod_def.start,
+            end: mod_def.start,
+        };
+
+        let mut children = vec![];
+
+        // handle constants
+        let cloned_const_def = mod_def.constants.clone();
+        for (sym, const_def_pos) in cloned_const_def {
+            let const_range = Range {
+                start: const_def_pos,
+                end: const_def_pos,
+            };
+
+            children.push(DocumentSymbol {
+                name: sym.clone().to_string(),
+                detail: None,
+                kind: SymbolKind::Constant,
+                range: const_range,
+                selection_range: const_range,
+                children: None,
+                tags: Some(vec![]),
+                deprecated: Some(false),
+            });
+        }
+
+        // handle structs
+        let cloned_struct_def = mod_def.structs.clone();
+        for (sym, struct_def) in cloned_struct_def {
+            let struct_range = Range {
+                start: struct_def.name_start,
+                end: struct_def.name_start,
+            };
+
+            let mut fields: Vec<DocumentSymbol> = vec![];
+            handle_struct_fields(struct_def, &mut fields);
+
+            children.push(DocumentSymbol {
+                name: sym.clone().to_string(),
+                detail: None,
+                kind: SymbolKind::Struct,
+                range: struct_range,
+                selection_range: struct_range,
+                children: Some(fields),
+                tags: Some(vec![]),
+                deprecated: Some(false),
+            });
+        }
+
+        // handle functions
+        let cloned_func_def = mod_def.functions.clone();
+        for (sym, func_def) in cloned_func_def {
+            let func_range = Range {
+                start: func_def.start,
+                end: func_def.start,
+            };
+
+            let mut detail = None;
+            if !func_def.attrs.is_empty() {
+                detail = Some(format!("{:?}", func_def.attrs));
+            }
+
+            children.push(DocumentSymbol {
+                name: sym.clone().to_string(),
+                detail,
+                kind: SymbolKind::Function,
+                range: func_range,
+                selection_range: func_range,
+                children: None,
+                tags: Some(vec![]),
+                deprecated: Some(false),
+            });
+        }
+
+        defs.push(DocumentSymbol {
+            name,
+            detail,
+            kind,
+            range,
+            selection_range: range,
+            children: Some(children),
+            tags: Some(vec![]),
+            deprecated: Some(false),
+        });
+    }
+
+    // unwrap will succeed based on the logic above which the compiler is unable to figure out
+    let response = lsp_server::Response::new_ok(request.id.clone(), defs);
+    if let Err(err) = context
+        .connection
+        .sender
+        .send(lsp_server::Message::Response(response))
+    {
+        eprintln!("could not send use response: {:?}", err);
+    }
+}
+
+/// Helper function to handle struct fields
+#[allow(deprecated)]
+fn handle_struct_fields(struct_def: StructDef, fields: &mut Vec<DocumentSymbol>) {
+    let clonded_fileds = struct_def.field_defs;
+
+    for field_def in clonded_fileds {
+        let field_range = Range {
+            start: field_def.start,
+            end: field_def.start,
+        };
+
+        fields.push(DocumentSymbol {
+            name: field_def.name.clone().to_string(),
+            detail: None,
+            kind: SymbolKind::Field,
+            range: field_range,
+            selection_range: field_range,
+            children: None,
+            tags: Some(vec![]),
+            deprecated: Some(false),
+        });
+    }
+}
+
 #[cfg(test)]
-fn assert_use_def(
+fn assert_use_def_with_doc_string(
     mod_symbols: &UseDefMap,
     file_name_mapping: &BTreeMap<FileHash, Symbol>,
     use_idx: usize,
@@ -2007,6 +2397,7 @@ fn assert_use_def(
     def_file: &str,
     type_str: &str,
     type_def: Option<(u32, u32, &str)>,
+    doc_string: &str,
 ) {
     let uses = mod_symbols.get(use_line).unwrap();
     let use_def = uses.iter().nth(use_idx).unwrap();
@@ -2019,6 +2410,8 @@ fn assert_use_def(
         .as_str()
         .ends_with(def_file));
     assert!(type_str == format!("{}", use_def.use_type));
+
+    assert!(doc_string == use_def.doc_string);
     match use_def.type_def_loc {
         Some(type_def_loc) => {
             let tdef_line = type_def.unwrap().0;
@@ -2034,6 +2427,258 @@ fn assert_use_def(
         }
         None => assert!(type_def.is_none()),
     }
+}
+
+#[cfg(test)]
+fn assert_use_def(
+    mod_symbols: &UseDefMap,
+    file_name_mapping: &BTreeMap<FileHash, Symbol>,
+    use_idx: usize,
+    use_line: u32,
+    use_col: u32,
+    def_line: u32,
+    def_col: u32,
+    def_file: &str,
+    type_str: &str,
+    type_def: Option<(u32, u32, &str)>,
+) {
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        file_name_mapping,
+        use_idx,
+        use_line,
+        use_col,
+        def_line,
+        def_col,
+        def_file,
+        type_str,
+        type_def,
+        "",
+    )
+}
+
+#[test]
+/// Tests if symbolication + doc_string information for documented Move constructs is constructed correctly.
+fn docstring_test() {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    path.push("tests/symbols");
+
+    let (symbols_opt, _) = Symbolicator::get_symbols(path.as_path()).unwrap();
+    let symbols = symbols_opt.unwrap();
+
+    let mut fpath = path.clone();
+    fpath.push("sources/M6.move");
+    let cpath = dunce::canonicalize(&fpath).unwrap();
+
+    let mod_symbols = symbols.file_use_defs.get(&cpath).unwrap();
+
+    // struct def name
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        0,
+        4,
+        11,
+        4,
+        11,
+        "M6.move",
+        "Symbols::M6::DocumentedStruct",
+        Some((4, 11, "M6.move")),
+        "This is a documented struct\nWith a multi-line docstring\n",
+    );
+
+    // const def name
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        0,
+        10,
+        10,
+        10,
+        10,
+        "M6.move",
+        "u64",
+        None,
+        "Constant containing the answer to the universe\n",
+    );
+
+    // function def name
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        0,
+        14,
+        8,
+        14,
+        8,
+        "M6.move",
+        "fun Symbols::M6::unpack(s: Symbols::M6::DocumentedStruct): u64",
+        None,
+        "A documented function that unpacks a DocumentedStruct\n",
+    );
+    // param var (unpack function)
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        1,
+        14,
+        15,
+        14,
+        15,
+        "M6.move",
+        "Symbols::M6::DocumentedStruct",
+        Some((4, 11, "M6.move")),
+        "A documented function that unpacks a DocumentedStruct\n",
+    );
+    // struct name in param type (unpack function)
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        2,
+        14,
+        18,
+        4,
+        11,
+        "M6.move",
+        "Symbols::M6::DocumentedStruct",
+        Some((4, 11, "M6.move")),
+        "This is a documented struct\nWith a multi-line docstring\n",
+    );
+    // struct name in unpack (unpack function)
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        0,
+        15,
+        12,
+        4,
+        11,
+        "M6.move",
+        "Symbols::M6::DocumentedStruct",
+        Some((4, 11, "M6.move")),
+        "This is a documented struct\nWith a multi-line docstring\n",
+    );
+    // field name in unpack (unpack function)
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        1,
+        15,
+        31,
+        6,
+        8,
+        "M6.move",
+        "u64",
+        None,
+        "A documented field\n",
+    );
+    // moved var in unpack assignment (unpack function)
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        3,
+        15,
+        59,
+        14,
+        15,
+        "M6.move",
+        "Symbols::M6::DocumentedStruct",
+        Some((4, 11, "M6.move")),
+        "A documented function that unpacks a DocumentedStruct\n",
+    );
+
+    // docstring construction for multi-line /** .. */ based strings
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        0,
+        26,
+        8,
+        26,
+        8,
+        "M6.move",
+        "fun Symbols::M6::other_doc_struct(): Symbols::M7::OtherDocStruct",
+        Some((3, 11, "M7.move")),
+        "\nThis is a multiline docstring\n\nThis docstring has empty lines.\n\nIt uses the ** format instead of ///\n\n",
+    );
+
+    // docstring construction for single-line /** .. */ based strings
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        0,
+        31,
+        8,
+        31,
+        8,
+        "M6.move",
+        "fun Symbols::M6::acq(addr: address): u64 acquires Symbols::M6::DocumentedStruct",
+        None,
+        "Asterix based single-line docstring\n",
+    );
+
+    /* Test doc_string construction for struct/function imported from another module */
+
+    // other module struct name (other_doc_struct function)
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        1,
+        26,
+        41,
+        3,
+        11,
+        "M7.move",
+        "Symbols::M7::OtherDocStruct",
+        Some((3, 11, "M7.move")),
+        "Documented struct in another module\n",
+    );
+
+    // function name in a call (other_doc_struct function)
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        0,
+        27,
+        21,
+        9,
+        15,
+        "M7.move",
+        "fun Symbols::M7::create_other_struct(v: u64): Symbols::M7::OtherDocStruct",
+        Some((3, 11, "M7.move")),
+        "Documented initializer in another module\n",
+    );
+
+    // const in param (other_doc_struct function)
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        1,
+        27,
+        41,
+        10,
+        10,
+        "M6.move",
+        "u64",
+        None,
+        "Constant containing the answer to the universe\n",
+    );
+
+    // // other documented struct name imported (other_doc_struct_import function)
+    assert_use_def_with_doc_string(
+        mod_symbols,
+        &symbols.file_name_mapping,
+        1,
+        38,
+        35,
+        3,
+        11,
+        "M7.move",
+        "Symbols::M7::OtherDocStruct",
+        Some((3, 11, "M7.move")),
+        "Documented struct in another module\n",
+    );
 }
 
 #[test]
@@ -2088,7 +2733,7 @@ fn symbols_test() {
         9,
         8,
         "M1.move",
-        "fun Symbols::M1::unpack(Symbols::M1::SomeStruct): u64",
+        "fun Symbols::M1::unpack(s: Symbols::M1::SomeStruct): u64",
         None,
     );
     // param var (unpack function)
@@ -2257,7 +2902,7 @@ fn symbols_test() {
         6,
         15,
         "M2.move",
-        "fun Symbols::M2::some_other_struct(u64): Symbols::M2::SomeOtherStruct",
+        "fun Symbols::M2::some_other_struct(v: u64): Symbols::M2::SomeOtherStruct",
         Some((2, 11, "M2.move")),
     );
     // const in param (other_mod_struct function)
@@ -2296,7 +2941,7 @@ fn symbols_test() {
         34,
         8,
         "M1.move",
-        "fun Symbols::M1::acq(address): u64 acquires Symbols::M1::SomeStruct",
+        "fun Symbols::M1::acq(addr: address): u64 acquires Symbols::M1::SomeStruct",
         None,
     );
     // struct name in acquires (acq function)
@@ -2478,7 +3123,7 @@ fn symbols_test() {
         61,
         8,
         "M1.move",
-        "fun Symbols::M1::ret(bool, u64): u64",
+        "fun Symbols::M1::ret(p1: bool, p2: u64): u64",
         None,
     );
     // returned value (ret function)

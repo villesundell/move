@@ -40,7 +40,7 @@ use crate::{
             convert_model_base_type, convert_model_local_type, convert_model_partial_struct_type,
             convert_model_struct_type, BaseType, CodeOffset, Type,
         },
-        value::{EvalState, GlobalState, LocalSlot, Pointer, TypedValue},
+        value::{BaseValue, EvalState, GlobalState, LocalSlot, Pointer, TypedValue},
     },
     shared::variant::choose_variant,
 };
@@ -109,6 +109,22 @@ impl<'env> FunctionContext<'env> {
     // execution
     //
 
+    /// Collect addresses stored in the value recursively
+    fn collect_addresses(val: &BaseValue, addresses: &mut Vec<AccountAddress>) {
+        match val {
+            BaseValue::Address(v) | BaseValue::Signer(v) => {
+                addresses.push(*v);
+            }
+            BaseValue::Vector(vec) | BaseValue::Struct(vec) => {
+                for (_, val) in vec.iter().enumerate() {
+                    Self::collect_addresses(val, addresses);
+                }
+            }
+            BaseValue::Bool(_) => (),
+            BaseValue::Int(_) => (),
+        }
+    }
+
     /// Execute a user function with value arguments.
     pub fn exec_user_function(
         &self,
@@ -117,6 +133,14 @@ impl<'env> FunctionContext<'env> {
         global_state: &mut GlobalState,
         eval_state: &mut EvalState,
     ) -> ExecResult<LocalState> {
+        // collect addresses
+        for (_, typed_arg) in typed_args.iter().enumerate() {
+            let mut addresses = vec![];
+            Self::collect_addresses(typed_arg.get_val(), &mut addresses);
+            global_state.put_touched_addresses(&addresses);
+        }
+
+        // execute the user function
         let instructions = self.target.get_bytecode();
         let debug_bytecode = self.get_settings().verbose_bytecode;
         let mut local_state = self.prepare_local_state(skip_specs, typed_args);
@@ -1448,7 +1472,7 @@ impl<'env> FunctionContext<'env> {
                 // TODO (mengxu): refactor the code to remove this clone
                 let mut cur = op_val.clone();
                 for (i, (val, edge)) in path.into_iter().zip(edges.iter()).rev().enumerate() {
-                    let ptr = trace.get(steps - 1 - i).unwrap();
+                    let ptr = trace.get(i).unwrap();
                     let sub = match edge {
                         BorrowEdge::Field(_, field_num) => {
                             val.update_ref_struct_field(*field_num, cur)
